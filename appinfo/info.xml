@@ -1,0 +1,28 @@
+<?xml version="1.0"?>
+<info xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:noNamespaceSchemaLocation="https://apps.nextcloud.com/schema/apps/info.xsd">
+
+    <id>sharepoint2</id>
+    <name>SharePoint Online OAuth2</name>
+    <summary>Dummy SharePoint Online backend (OAuth2-ready)</summary>
+    <description>
+        Blank backend for developing SharePoint Online OAuth2 storage integration.
+        Currently only displays a new option in External storage.
+    </description>
+
+    <version>0.0.1</version>
+    <licence>agpl</licence>
+    <author>Your Name</author>
+
+    <!-- This defines the PHP namespace root: OCA\Sharepoint2\* -->
+    <namespace>Sharepoint2</namespace>
+
+    <types>
+        <filesystem/>
+    </types>
+
+    <dependencies>
+        <nextcloud min-version="27" max-version="32" />
+        <app id="files_external" min-version="1" max-version="999" />
+    </dependencies>
+</info>
