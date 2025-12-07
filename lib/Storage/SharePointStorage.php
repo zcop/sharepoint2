@@ -7,6 +7,8 @@ use ArrayIterator;
 use OC\Files\Storage\Common;
 use OCP\Http\Client\IClientService;
 use OCP\Constants;
+use OCP\IUserSession;
+use OCA\Sharepoint2\Service\MSOAuth2TokenService;
 use Psr\Log\LoggerInterface;
 use Traversable;
 
@@ -15,9 +17,6 @@ class SharePointStorage extends Common {
 
 	private string $siteUrl;
 	private string $libraryPath;
-
-	/** @var array<string,mixed>|null */
-	private ?array $token = null;
 
 	private ?string $siteId = null;
 	private ?string $driveId = null;
@@ -43,6 +42,11 @@ class SharePointStorage extends Common {
 	private string $tenant = 'fc153689-bfec-4013-a019-103b83f98ee1';
 
 	private IClientService $httpClientService;
+	private MSOAuth2TokenService $tokenService;
+	private IUserSession $userSession;
+
+/** Cached access token for this storage/user */
+private ?string $accessToken = null;
 
 	private ?LoggerInterface $logger = null;
 
@@ -68,33 +72,9 @@ class SharePointStorage extends Common {
 
 		$server                  = \OC::$server;
 		$this->httpClientService = $server->get(IClientService::class);
-
-		// Decode token stored like files_external_onedrive:
-		//   base64( gzdeflate( json_encode(tokenArray), 9 ) )
-		$rawToken    = $params['token'] ?? null;
-		$this->token = null;
-
-		if (is_string($rawToken) && $rawToken !== '') {
-			$compressed = base64_decode($rawToken, true);
-			if ($compressed === false) {
-				$this->log('token decode: base64_decode failed');
-			} else {
-				$json = @gzinflate($compressed);
-				if ($json === false) {
-					$this->log('token decode: gzinflate failed');
-				} else {
-					$data = json_decode($json, true);
-					if (!is_array($data)) {
-						$this->log('token decode: json_decode failed');
-					} else {
-						$this->token = $data;
-					}
-				}
-			}
-		} elseif (is_array($rawToken)) {
-			$this->token = $rawToken;
-		}
-
+		$this->tokenService      = $server->get(MSOAuth2TokenService::class);
+		$this->userSession       = $server->get(IUserSession::class);
+		
 		parent::__construct($params);
 	}
 
@@ -239,134 +219,39 @@ class SharePointStorage extends Common {
 		return [$libraryName, $subPath];
 	}
 
-	/**
-	 * Ensure we have a (non-expired) access token in $this->token['access_token'].
-	 */
 	private function ensureAccessToken(): bool {
-		if ($this->token === null) {
-			$this->log('ensureAccessToken(): no token structure decoded at all');
-			return false;
-		}
-
-		if (!empty($this->token['access_token'])) {
-			$now        = time();
-			$obtainedAt = isset($this->token['obtained_at']) ? (int)$this->token['obtained_at'] : ($now - 60);
-			$expiresIn  = isset($this->token['expires_in']) ? (int)$this->token['expires_in'] : 3600;
-
-			// Refresh 5 minutes before actual expiry
-			if ($now < $obtainedAt + $expiresIn - 300) {
-				return true;
-			}
-
-			$this->log('ensureAccessToken(): access_token present but considered expired/near expiry');
-		} else {
-			$this->log('ensureAccessToken(): no access_token yet, will try refresh');
-		}
-
-		return $this->refreshAccessToken();
-	}
-
-	/**
-	 * Use refresh_token + client credentials to get a fresh access_token.
-	 * Does NOT persist anything to DB yet (test phase only).
-	 */
-	private function refreshAccessToken(): bool {
-		if ($this->token === null || empty($this->token['refresh_token'])) {
-			$this->log('refreshAccessToken(): no refresh_token available', [
-				'has_token' => $this->token !== null,
-				'keys'      => $this->token ? array_keys($this->token) : null,
-			]);
-			return false;
-		}
-
-		if ($this->clientId === '' || $this->clientSecret === '') {
-			$this->log('refreshAccessToken(): client_id or client_secret missing', [
-				'clientId_empty'     => $this->clientId === '',
-				'clientSecret_empty' => $this->clientSecret === '',
-			]);
-			return false;
-		}
-
-		// Prefer tenant from token if present; otherwise use configured tenant (or "common").
-		$tenant = isset($this->token['tenant']) && is_string($this->token['tenant'])
-			? $this->token['tenant']
-			: $this->tenant;
-
-		$tokenUrl = 'https://login.microsoftonline.com/' . rawurlencode($tenant) . '/oauth2/v2.0/token';
-
-		$scope = isset($this->token['scope']) && is_string($this->token['scope'])
-			? $this->token['scope']
-			: 'https://graph.microsoft.com/.default';
-
-		$body = [
-			'client_id'     => $this->clientId,
-			'client_secret' => $this->clientSecret,
-			'grant_type'    => 'refresh_token',
-			'refresh_token' => $this->token['refresh_token'],
-			'scope'         => $scope,
-		];
-
-		$client = $this->httpClientService->newClient();
-
-		try {
-			$this->log('refreshAccessToken(): POST token request', [
-				'tokenUrl' => $tokenUrl,
-				'scope'    => $scope,
-			]);
-
-			$response = $client->post($tokenUrl, [
-				'headers' => [
-					'Content-Type' => 'application/x-www-form-urlencoded',
-				],
-				'body'    => http_build_query($body, '', '&'),
-				'timeout' => 30,
-			]);
-
-			$rawBody = (string)$response->getBody();
-			$payload = json_decode($rawBody, true);
-
-			if (!is_array($payload)) {
-				$this->log('refreshAccessToken(): token endpoint returned non-JSON', [
-					'bodySample' => substr($rawBody, 0, 200),
-				]);
-				return false;
-			}
-
-			if (!empty($payload['error'])) {
-				$this->log('refreshAccessToken(): error from token endpoint', [
-					'error'             => $payload['error'],
-					'error_description' => $payload['error_description'] ?? null,
-				]);
-				return false;
-			}
-
-			if (empty($payload['access_token'])) {
-				$this->log('refreshAccessToken(): no access_token in response', [
-					'keys' => array_keys($payload),
-				]);
-				return false;
-			}
-
-			$this->token['access_token'] = $payload['access_token'];
-			$this->token['expires_in']   = isset($payload['expires_in']) ? (int)$payload['expires_in'] : 3600;
-			$this->token['obtained_at']  = time();
-
-			if (!empty($payload['refresh_token'])) {
-				$this->token['refresh_token'] = $payload['refresh_token'];
-			}
-
-			if (!empty($payload['scope']) && is_string($payload['scope'])) {
-				$this->token['scope'] = $payload['scope'];
-			}
-
+		// Already fetched and still valid in this PHP request
+		if ($this->accessToken !== null) {
 			return true;
-		} catch (\Throwable $e) {
-			$this->log('refreshAccessToken(): exception', [
-				'message' => $e->getMessage(),
-				'class'   => get_class($e),
+		}
+
+		$user = $this->userSession->getUser();
+		if ($user === null) {
+			$this->log('ensureAccessToken(): no logged-in user');
+			return false;
+		}
+		$userId = $user->getUID();
+
+		// For now we use storageId = 0 (per-user, per-tenant token).
+		// You can later change this to a real mount id if desired.
+		$accessToken = $this->tokenService->getValidAccessToken(
+			0,
+			$userId,
+			$this->tenant,
+			$this->clientId,
+			$this->clientSecret
+		);
+
+		if ($accessToken === null || $accessToken === '') {
+			$this->log('ensureAccessToken(): getValidAccessToken() returned no token', [
+				'userId' => $userId,
+				'tenant' => $this->tenant,
 			]);
 			return false;
 		}
+
+		$this->accessToken = $accessToken;
+		return true;
 	}
 
 	/**
@@ -386,7 +271,7 @@ class SharePointStorage extends Common {
 		try {
 			$response = $client->get(self::GRAPH_BASE . $path, [
 				'headers' => [
-					'Authorization' => 'Bearer ' . $this->token['access_token'],
+					'Authorization' => 'Bearer ' . $this->accessToken,
 					'Accept'        => 'application/json',
 				],
 				'timeout' => 30,
@@ -434,7 +319,7 @@ class SharePointStorage extends Common {
 		try {
 			$response = $client->get(self::GRAPH_BASE . $path, [
 				'headers' => [
-					'Authorization' => 'Bearer ' . $this->token['access_token'],
+					'Authorization' => 'Bearer ' . $this->accessToken,
 				],
 				'timeout' => 60,
 			]);

@@ -3,19 +3,21 @@ declare(strict_types=1);
 
 namespace OCA\Sharepoint2\Controller;
 
+use OCA\Sharepoint2\Service\MSOAuth2TokenService;
 use OCP\AppFramework\Controller;
 use OCP\AppFramework\Http;
 use OCP\AppFramework\Http\DataResponse;
-use OCP\IRequest;
-use OCP\Util;
 use OCP\Http\Client\IClientService;
+use OCP\IRequest;
+use OCP\IUserSession;
+use Psr\Log\LoggerInterface;
 
 /**
  * OAuth2 controller for SharePoint Online backend.
  *
  * Two-step flow:
  *  step=1: build authorization URL and send it to frontend
- *  step=2: exchange authorization code for tokens and return encoded token blob
+ *  step=2: exchange authorization code for tokens, store them via MSOAuth2TokenService
  *
  * Frontend logic lives in js/sharepoint2.js.
  */
@@ -37,18 +39,29 @@ class OauthController extends Controller {
 	/** Scopes we request */
 	private const SCOPES           = 'offline_access Files.ReadWrite.All Sites.ReadWrite.All User.Read';
 
-	public function __construct(string $appName, IRequest $request) {
+	private IClientService $clientService;
+	private MSOAuth2TokenService $tokenService;
+	private IUserSession $userSession;
+	private LoggerInterface $logger;
+
+	public function __construct(
+		string $appName,
+		IRequest $request,
+		IClientService $clientService,
+		MSOAuth2TokenService $tokenService,
+		IUserSession $userSession,
+		LoggerInterface $logger
+	) {
 		parent::__construct($appName, $request);
+		$this->clientService = $clientService;
+		$this->tokenService  = $tokenService;
+		$this->userSession   = $userSession;
+		$this->logger        = $logger;
 	}
 
 	private function logError(string $message, array $context = []): void {
-		if (class_exists('\OC_Log')) {
-			\OC_Log::write(
-				'sharepoint2',
-				$message . (!empty($context) ? ' ' . json_encode($context) : ''),
-				Util::ERROR
-			);
-		}
+		$context['app'] = 'sharepoint2';
+		$this->logger->error($message, $context);
 	}
 
 	/**
@@ -102,7 +115,7 @@ class OauthController extends Controller {
 			);
 		}
 
-		$step = (int) $step;
+		$step = (int)$step;
 
 		// -------------------
 		// STEP 1: auth URL
@@ -145,9 +158,22 @@ class OauthController extends Controller {
 			}
 
 			try {
-				/** @var IClientService $clientService */
-				$clientService = \OC::$server->get(IClientService::class);
-				$client = $clientService->newClient();
+				$user = $this->userSession->getUser();
+				if ($user === null) {
+					$msg = 'No logged-in user during OAuth2 token exchange';
+					$this->logError($msg);
+
+					return new DataResponse(
+						[
+							'status' => 'error',
+							'data'   => ['message' => $msg],
+						],
+						Http::STATUS_OK
+					);
+				}
+				$userId = $user->getUID();
+
+				$client = $this->clientService->newClient();
 
 				$body = http_build_query([
 					'client_id'     => $clientId,
@@ -167,7 +193,7 @@ class OauthController extends Controller {
 				]);
 
 				$statusCode = $response->getStatusCode();
-				$content    = (string) $response->getBody();
+				$content    = (string)$response->getBody();
 
 				if ($statusCode < 200 || $statusCode >= 300) {
 					$msg = 'Token endpoint returned HTTP ' . $statusCode;
@@ -202,24 +228,31 @@ class OauthController extends Controller {
 					);
 				}
 
-				// ---- Build a compact token payload to store in DB ----
+				// Store token in DB using central service.
+				// For now we use storageId = 0 so the token is per (user, tenant).
+				$this->tokenService->storeInitialToken(
+					0,
+					$userId,
+					self::TENANT,
+					$token
+				);
+
+				// Build a compact token payload to store in external config as legacy field.
+				// This keeps JS code unchanged, but SharePointStorage will ignore it
+				// and always use MSOAuth2TokenService instead.
 				$stored = [
-					// keep refresh token primarily; we can always get a new access token
 					'refresh_token' => $token['refresh_token'] ?? '',
-					// keep access token if space allows
 					'access_token'  => $token['access_token'] ?? '',
 					'scope'         => $token['scope'] ?? '',
 					'token_type'    => $token['token_type'] ?? '',
-					'expires_in'    => isset($token['expires_in']) ? (int) $token['expires_in'] : 3600,
+					'expires_in'    => isset($token['expires_in']) ? (int)$token['expires_in'] : 3600,
 					'obtained_at'   => time(),
 					'tenant'        => self::TENANT,
 					'code_uid'      => uniqid('', true),
 				];
 
-				// First try with full data
 				$encoded = base64_encode(gzdeflate(json_encode($stored), 9));
 
-				// If still too large for oc_external_config.value (~4000), drop access_token, then scope.
 				if (strlen($encoded) > 3500) {
 					unset($stored['access_token']);
 					$encoded = base64_encode(gzdeflate(json_encode($stored), 9));
@@ -229,7 +262,6 @@ class OauthController extends Controller {
 					$encoded = base64_encode(gzdeflate(json_encode($stored), 9));
 				}
 
-				// Final safety check
 				if (strlen($encoded) > 3900) {
 					$msg = 'Encoded token still too large to store (length=' . strlen($encoded) . ')';
 					$this->logError($msg);
@@ -252,7 +284,7 @@ class OauthController extends Controller {
 				);
 			} catch (\Throwable $e) {
 				$msg = 'Exception during token exchange: ' . $e->getMessage();
-				$this->logError($msg);
+				$this->logError($msg, ['exception' => $e]);
 
 				return new DataResponse(
 					[
