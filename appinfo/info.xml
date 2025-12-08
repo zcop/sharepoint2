@@ -4,15 +4,17 @@
 
     <id>sharepoint2</id>
     <name>SharePoint Online OAuth2</name>
-    <summary>Dummy SharePoint Online backend (OAuth2-ready)</summary>
+    <summary>SharePoint Online external storage backend using OAuth2 and Microsoft Graph</summary>
     <description>
-        Blank backend for developing SharePoint Online OAuth2 storage integration.
-        Currently only displays a new option in External storage.
+        SharePoint2 provides a SharePoint Online backend for Nextcloud External storage,
+        authenticating with OAuth2 and Microsoft Graph so Microsoft 365 tenants (including
+        those enforcing multi-factor authentication) can mount document libraries without
+        relying on legacy SharePoint REST flows.
     </description>
 
     <version>0.0.1</version>
     <licence>agpl</licence>
-    <author>Your Name</author>
+    <author>zcop</author>
 
     <!-- This defines the PHP namespace root: OCA\Sharepoint2\* -->
     <namespace>Sharepoint2</namespace>
@@ -21,8 +23,12 @@
         <filesystem/>
     </types>
 
+    <category>
+        <integration/>
+    </category>
+
     <dependencies>
-        <nextcloud min-version="27" max-version="32" />
+        <nextcloud min-version="32" max-version="32" />
         <app id="files_external" min-version="1" max-version="999" />
     </dependencies>
 </info>
