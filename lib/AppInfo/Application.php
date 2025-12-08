@@ -3,7 +3,7 @@ declare(strict_types=1);
 
 namespace OCA\Sharepoint2\AppInfo;
 
-use OCA\Files_External\Lib\Config\IBackendProvider; // <--- Critical Import
+use OCA\Files_External\Lib\Config\IBackendProvider;
 use OCA\Files_External\Service\BackendService;
 use OCA\Sharepoint2\Backend\SpoBackend;
 use OCA\Sharepoint2\Service\RefreshTokensService;
@@ -24,17 +24,20 @@ class Application extends App implements IBootstrap, IBackendProvider {
     }
 
     public function register(IRegistrationContext $context): void {
-        // No manual registration needed. 
-        // NC32 automatically handles dependency injection for MSOAuth2TokenService.
+        // No container tweaks needed at registration time.
     }
 
     public function boot(IBootContext $context): void {
         $context->injectFn(function (BackendService $backendService, IJobList $jobList): void {
             
-            // 1. Register Backend Provider
+            // Register backend provider once the Files External service is available
             $backendService->registerBackendProvider($this);
 
-            // 2. Register Cron Job
+            // Guard cron job registration to avoid duplicate enqueues across boots
+            if ($jobList->has(RefreshTokensService::class)) {
+                return;
+            }
+
             $jobList->add(RefreshTokensService::class);
         });
     }
