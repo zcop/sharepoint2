@@ -99,12 +99,14 @@ $(document).ready(function () {
 		var tr = $(this).closest('tr');
 		var client_id = tr.find('.configuration [data-parameter="client_id"]').val().trim();
 		var client_secret = tr.find('.configuration [data-parameter="client_secret"]').val().trim();
-
+		var tenant = tr.find('.configuration [data-parameter="tenant"]').val().trim();
+		
 		if (client_id !== '' && client_secret !== '') {
 			$('.configuration').trigger('sharepoint2_oauth_step1', [{
 				backend_id: backendId,
 				client_id: client_id,
 				client_secret: client_secret,
+				tenant: tenant,
 				redirect: location.protocol + '//' + location.host + location.pathname,
 				tr: tr
 			}]);
@@ -158,6 +160,7 @@ $(document).ready(function () {
 			step: 1,
 			client_id: data['client_id'],
 			client_secret: client_secret,
+			tenant: data['tenant'],
 			redirect: data['redirect']
 		})
 			.done(function (result) {

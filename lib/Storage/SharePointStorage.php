@@ -8,628 +8,364 @@ use OC\Files\Storage\Common;
 use OCP\Http\Client\IClientService;
 use OCP\Constants;
 use OCP\IUserSession;
+use OCP\IConfig;
 use OCA\Sharepoint2\Service\MSOAuth2TokenService;
 use Psr\Log\LoggerInterface;
 use Traversable;
 
 class SharePointStorage extends Common {
-	private const GRAPH_BASE = 'https://graph.microsoft.com/v1.0';
+    // Increase timeout for large folders
+    private const API_TIMEOUT = 120;
+    private const GRAPH_BASE = 'https://graph.microsoft.com/v1.0';
 
-	private string $siteUrl;
-	private string $libraryPath;
+    private string $siteUrl;
+    private string $libraryPath;
 
-	private ?string $siteId = null;
-	private ?string $driveId = null;
+    private ?string $siteId = null;
+    private ?string $driveId = null;
 
-	/**
-	 * Path inside the drive that corresponds to the mount root, relative to drive root.
-	 * Example: "" (root of library) or "SubFolder/More".
-	 */
-	private string $mountRootPath = '';
+    private string $mountRootPath = '';
+    private string $numericId;
+    private string $clientId = '';
+    private string $clientSecret = '';
+    private string $tenant;
 
-	/**
-	 * Stable id for this storage (used in oc_storages).
-	 */
-	private string $numericId;
+    private IClientService $httpClientService;
+    private MSOAuth2TokenService $tokenService;
+    private IUserSession $userSession;
+    private IConfig $config;
+    private LoggerInterface $logger;
 
-	private string $clientId = '';
-	private string $clientSecret = '';
+    private ?string $accessToken = null;
 
-	/**
-	 * Tenant for token endpoint. For testing you can hardcode your tenant here
-	 * (e.g. "edcvn.onmicrosoft.com" or the GUID tenant id).
-	 */
-	private string $tenant = 'fc153689-bfec-4013-a019-103b83f98ee1';
+    public function __construct(array $params) {
+        $this->tokenService      = \OC::$server->get(MSOAuth2TokenService::class);
+        $this->httpClientService = \OC::$server->get(IClientService::class);
+        $this->userSession       = \OC::$server->get(IUserSession::class);
+        $this->config            = \OC::$server->get(IConfig::class);
+        $this->logger            = \OC::$server->get(LoggerInterface::class);
 
-	private IClientService $httpClientService;
-	private MSOAuth2TokenService $tokenService;
-	private IUserSession $userSession;
+        $this->siteUrl     = rtrim((string)($params['site_url'] ?? ''), '/');
+        $this->libraryPath = trim((string)($params['library'] ?? ''), '/');
+        $this->clientId    = (string)($params['client_id'] ?? '');
+        $this->clientSecret = (string)($params['client_secret'] ?? '');
+        
+        // Tenant Logic
+        $tenantInput = trim((string)($params['tenant'] ?? ''));
+        $tenantConfig = $this->config->getSystemValue('sharepoint2_tenant', '');
 
-/** Cached access token for this storage/user */
-private ?string $accessToken = null;
+        if ($tenantInput !== '') {
+            $this->tenant = $tenantInput;
+        } elseif ($tenantConfig !== '') {
+            $this->tenant = $tenantConfig;
+        } else {
+            $this->tenant = 'common';
+        }
 
-	private ?LoggerInterface $logger = null;
+        $this->numericId = md5($this->siteUrl . '|' . $this->libraryPath . '|' . $this->clientId);
 
-	/**
-	 * @param array<string,mixed> $params
-	 *   Expected keys from the backend config:
-	 *     - site_url   (string, required)
-	 *     - library    (string, required; e.g. "Documents" or "Documents/SubFolder")
-	 *     - client_id  (string, required)
-	 *     - client_secret (string, required)
-	 *     - token      (string, encoded refresh token JSON from OAuth2 controller)
-	 *     - tenant     (string, optional; tenant id or domain; defaults to "common")
-	 */
-	public function __construct(array $params) {
-		$this->siteUrl     = rtrim((string)($params['site_url'] ?? ''), '/');
-		$this->libraryPath = trim((string)($params['library'] ?? ''), '/');
+        parent::__construct($params);
+    }
 
-		$this->clientId     = (string)($params['client_id'] ?? '');
-		$this->clientSecret = (string)($params['client_secret'] ?? '');
-		$this->tenant       = (string)($params['tenant'] ?? 'common');
+    private function log(string $message, array $context = []): void {
+        $this->logger->warning('SharePointStorage: ' . $message, $context);
+    }
 
-		$this->numericId = md5($this->siteUrl . '|' . $this->libraryPath . '|' . $this->clientId);
+    public function getId(): string {
+        $key = implode('|', [$this->siteUrl, $this->libraryPath, $this->mountRootPath]);
+        return 'sharepoint2::' . sha1($key);
+    }
+    
+    public function test(): bool {
+        if (!$this->ensureAccessToken()) return false;
+        if ($this->siteUrl === '') return false;
+        return $this->initialize();
+    }
 
-		$server                  = \OC::$server;
-		$this->httpClientService = $server->get(IClientService::class);
-		$this->tokenService      = $server->get(MSOAuth2TokenService::class);
-		$this->userSession       = $server->get(IUserSession::class);
-		
-		parent::__construct($params);
-	}
+    private function initialize(): bool {
+        if ($this->siteId !== null && $this->driveId !== null) {
+            return true;
+        }
 
-	/**
-	 * Lazy logger getter.
-	 */
-	private function log(string $message, array $context = []): void {
-		if ($this->logger === null) {
-			$this->logger = \OC::$server->get(LoggerInterface::class);
-		}
+        if (!$this->ensureAccessToken()) return false;
 
-		$this->logger->warning('SharePointStorage: ' . $message, $context);
-	}
+        $parts = parse_url($this->siteUrl);
+        if (!is_array($parts) || empty($parts['host']) || empty($parts['path'])) {
+            $this->log('initialize(): invalid siteUrl', ['siteUrl' => $this->siteUrl]);
+            return false;
+        }
 
-	/**
-	 * Storage id used in oc_storages (must be stable).
-	 */
-	public function getId(): string {
-		// Build a deterministic key using stable configuration values
-		$key = implode('|', [
-			$this->siteUrl,
-			$this->libraryPath,
-			$this->mountRootPath,
-		]);
+        // 1. Get Site ID
+        $site = $this->graphGet("/sites/{$parts['host']}:{$parts['path']}");
+        if (!is_array($site) || empty($site['id'])) {
+            $this->log('initialize(): failed to resolve siteId');
+            return false;
+        }
+        $this->siteId = (string)$site['id'];
 
-		// Return a stable SharePoint2 storage ID
-		return 'sharepoint2::' . sha1($key);
-	}
-	
-	/**
-	 * Nextcloud calls test() when you click the checkmark in External storages.
-	 */
-	public function test(): bool {
-		if (!$this->ensureAccessToken()) {
-			$this->log('test(): ensureAccessToken() failed');
-			return false;
-		}
+        // 2. Get Drive ID
+        [$libraryName, $subPath] = $this->splitLibraryPath($this->libraryPath);
+        
+        // Loop through all drives (pagination supported)
+        $allDrives = $this->fetchAllPages("/sites/{$this->siteId}/drives");
+        
+        foreach ($allDrives as $drive) {
+            if (isset($drive['name']) && (string)$drive['name'] === $libraryName) {
+                $this->driveId = (string)$drive['id'];
+                break;
+            }
+        }
 
-		if ($this->siteUrl === '' || $this->libraryPath === '') {
-			$this->log('test(): site_url or library is empty', [
-				'siteUrl'     => $this->siteUrl,
-				'libraryPath' => $this->libraryPath,
-			]);
-			return false;
-		}
+        if ($this->driveId === null) {
+            $this->log('initialize(): library not found', ['lib' => $libraryName]);
+            return false;
+        }
 
-		$ok = $this->initialize();
+        // 3. Resolve SubPath
+        $this->mountRootPath = '';
+        if ($subPath !== '') {
+            $encodedPath = $this->encodeDrivePath($subPath);
+            $item = $this->graphGet("/drives/{$this->driveId}/root:/{$encodedPath}:/");
+            if (!isset($item['id'])) {
+                $this->log('initialize(): subPath not found');
+                return false;
+            }
+            $this->mountRootPath = $subPath;
+        }
+        return true;
+    }
 
-		return $ok;
-	}
-
-	/**
-	 * Resolve siteId, driveId and mountRootPath from site_url + libraryPath.
-	 */
-	private function initialize(): bool {
-		if ($this->siteId !== null && $this->driveId !== null) {
-			return true;
-		}
-
-		if (!$this->ensureAccessToken()) {
-			$this->log('initialize(): ensureAccessToken() failed');
-			return false;
-		}
-
-		$parts = parse_url($this->siteUrl);
-		if (!is_array($parts) || empty($parts['host']) || empty($parts['path'])) {
-			$this->log('initialize(): invalid siteUrl', ['siteUrl' => $this->siteUrl]);
-			return false;
-		}
-
-		$host = $parts['host'];
-		$path = $parts['path'];
-
-		$site = $this->graphGet("/sites/{$host}:{$path}");
-		if (!is_array($site) || empty($site['id'])) {
-			$this->log('initialize(): failed to resolve siteId', [
-				'host'     => $host,
-				'path'     => $path,
-				'response' => $site,
-			]);
-			return false;
-		}
-		$this->siteId = (string)$site['id'];
-
-		// Split libraryPath into libraryName + subPath
-		[$libraryName, $subPath] = $this->splitLibraryPath($this->libraryPath);
-
-		// Find driveId by libraryName
-		$drives = $this->graphGet("/sites/{$this->siteId}/drives");
-		if (!is_array($drives) || empty($drives['value']) || !is_array($drives['value'])) {
-			$this->log('initialize(): failed to list drives', ['response' => $drives]);
-			return false;
-		}
-
-		$driveId = null;
-		foreach ($drives['value'] as $drive) {
-			if (isset($drive['name']) && (string)$drive['name'] === $libraryName) {
-				$driveId = (string)$drive['id'];
-				break;
-			}
-		}
-
-		if ($driveId === null) {
-			$this->log('initialize(): library not found among drives', [
-				'libraryName' => $libraryName,
-				'drives'      => $drives['value'],
-			]);
-			return false;
-		}
-		$this->driveId = $driveId;
-
-		// Verify subPath (if any) exists as a folder
-		$this->mountRootPath = '';
-		if ($subPath !== '') {
-			$encodedPath = $this->encodeDrivePath($subPath);
-			$item        = $this->graphGet("/drives/{$this->driveId}/root:/{$encodedPath}:/");
-			if (!is_array($item) || !isset($item['id']) || !isset($item['folder'])) {
-				$this->log('initialize(): subPath is not a folder', [
-					'subPath' => $subPath,
-					'item'    => $item,
-				]);
-				return false;
-			}
-			$this->mountRootPath = $subPath;
-		}
-		return true;
-	}
-
-	/**
-	 * Split "Documents/SubFolder" → ["Documents", "SubFolder"].
-	 *
-	 * @return array{0:string,1:string}
-	 */
-	private function splitLibraryPath(string $libraryPath): array {
-		$parts = array_values(array_filter(explode('/', $libraryPath), 'strlen'));
-		if ($parts === []) {
-			return ['Documents', ''];
-		}
-		$libraryName = array_shift($parts);
-		$subPath     = implode('/', $parts);
-
-		return [$libraryName, $subPath];
-	}
-
-	private function ensureAccessToken(): bool {
-		// Already fetched and still valid in this PHP request
-		if ($this->accessToken !== null) {
-			return true;
-		}
-
-		$user = $this->userSession->getUser();
-		if ($user === null) {
-			$this->log('ensureAccessToken(): no logged-in user');
-			return false;
-		}
-		$userId = $user->getUID();
-
-		// For now we use storageId = 0 (per-user, per-tenant token).
-		// You can later change this to a real mount id if desired.
-		$accessToken = $this->tokenService->getValidAccessToken(
-			0,
-			$userId,
-			$this->tenant,
-			$this->clientId,
-			$this->clientSecret
-		);
-
-		if ($accessToken === null || $accessToken === '') {
-			$this->log('ensureAccessToken(): getValidAccessToken() returned no token', [
-				'userId' => $userId,
-				'tenant' => $this->tenant,
-			]);
-			return false;
-		}
-
-		$this->accessToken = $accessToken;
-		return true;
-	}
-
-	/**
-	 * Perform Graph GET and decode JSON.
-	 *
-	 * @param string $path e.g. "/sites/{host}:{path}" or "/drives/{id}/root/children"
-	 * @return array<string,mixed>|null
-	 */
-	private function graphGet(string $path): ?array {
-		if (!$this->ensureAccessToken()) {
-			$this->log('graphGet(): ensureAccessToken() failed', ['path' => $path]);
-			return null;
-		}
-
-		$client = $this->httpClientService->newClient();
-
-		try {
-			$response = $client->get(self::GRAPH_BASE . $path, [
-				'headers' => [
-					'Authorization' => 'Bearer ' . $this->accessToken,
-					'Accept'        => 'application/json',
-				],
-				'timeout' => 30,
-			]);
-
-			$body = (string)$response->getBody();
-			$data = json_decode($body, true);
-
-			if (!is_array($data)) {
-				$this->log('graphGet(): invalid JSON', [
-					'path'       => $path,
-					'bodySample' => substr($body, 0, 200),
-				]);
-				return null;
-			}
-
-			return $data;
-		} catch (\Throwable $e) {
-			$this->log('graphGet(): error', [
-				'path'    => $path,
-				'message' => $e->getMessage(),
-			]);
-			return null;
-		}
-	}
-
-	/**
-	 * Download raw content of an item.
-	 */
-	private function downloadItemContent(string $itemId): ?string {
-		if (!$this->ensureAccessToken()) {
-			$this->log('downloadItemContent(): ensureAccessToken() failed', [
-				'itemId' => $itemId,
-			]);
-			return null;
-		}
-
-		if ($this->driveId === null) {
-			return null;
-		}
-
-		$path   = "/drives/{$this->driveId}/items/{$itemId}/content";
-		$client = $this->httpClientService->newClient();
-
-		try {
-			$response = $client->get(self::GRAPH_BASE . $path, [
-				'headers' => [
-					'Authorization' => 'Bearer ' . $this->accessToken,
-				],
-				'timeout' => 60,
-			]);
-			return (string)$response->getBody();
-		} catch (\Throwable $e) {
-			$this->log('downloadItemContent(): error', [
-				'itemId'  => $itemId,
-				'message' => $e->getMessage(),
-			]);
-			return null;
-		}
-	}
-
-	/**
-	 * Encode a drive-relative path for Graph :/path:/ syntax.
-	 */
-	private function encodeDrivePath(string $path): string {
-		$parts = array_values(array_filter(explode('/', $path), 'strlen'));
-		$parts = array_map('rawurlencode', $parts);
-		return implode('/', $parts);
-	}
-
-	/**
-	 * Combine mountRootPath and a Nextcloud-relative path to a drive-relative path.
-	 *
-	 * Examples:
-	 *  mountRootPath = ''   , relativePath = ''        => ''
-	 *  mountRootPath = ''   , relativePath = 'foo'     => 'foo'
-	 *  mountRootPath = 'A'  , relativePath = ''        => 'A'
-	 *  mountRootPath = 'A'  , relativePath = 'B/C'     => 'A/B/C'
-	 */
-	private function buildDrivePath(string $relativePath): string {
-		$root = trim($this->mountRootPath, '/');
-		$rel  = trim($relativePath, '/');
-
-		// No mount root: just use the relative path
-		if ($root === '') {
-			return $rel;
-		}
-		// Mount root only (listing root of mounted folder)
-		if ($rel === '') {
-			return $root;
-		}
-		return $root . '/' . $rel;
-	}
-
-	/**
-	 * List children of a drive-relative path (relative to mount root).
-	 *
-	 * @param string $relativePath path relative to mount root
-	 * @return array<int,array<string,mixed>>
-	 */
-	private function listChildren(string $relativePath): array {
-		if (!$this->initialize()) {
-			return [];
-		}
+/**
+     * Optimized List Children:
+     * 1. Uses $top=999 to reduce HTTP requests by 5x.
+     * 2. Uses $select to fetch only needed fields (smaller JSON).
+     */
+    private function listChildren(string $relativePath): array {
+        if (!$this->initialize()) return [];
  
-		$drivePath = $this->buildDrivePath($relativePath);
+        $drivePath = $this->buildDrivePath($relativePath);
 
-		if ($drivePath === '') {
-			$graphPath = "/drives/{$this->driveId}/root/children";
-		} else {
-			$encoded   = $this->encodeDrivePath($drivePath);
-			$graphPath = "/drives/{$this->driveId}/root:/{$encoded}:/children";
-		}
+        // OPTIMIZATION: Request max page size (999) and only specific fields
+        $query = '?$top=999&$select=id,name,folder,file,size,lastModifiedDateTime,eTag';
 
-		$data = $this->graphGet($graphPath);
+        if ($drivePath === '') {
+            $graphPath = "/drives/{$this->driveId}/root/children{$query}";
+        } else {
+            $encoded   = $this->encodeDrivePath($drivePath);
+            $graphPath = "/drives/{$this->driveId}/root:/{$encoded}:/children{$query}";
+        }
 
-		if (!is_array($data) || !array_key_exists('value', $data) || !is_array($data['value'])) {
-			$this->log('listChildren(): empty or invalid response', [
-				'graphPath' => $graphPath,
-				'dataType'  => gettype($data),
-				'dataKeys'  => is_array($data) ? array_keys($data) : null,
-			]);
-			return [];
-		}
+        // fetchAllPages handles the pagination if > 999 items
+        return $this->fetchAllPages($graphPath);
+    }
 
-		$count = count($data['value']);
-		return $data['value'];
-	}
+    /**
+     * Recursively follows @odata.nextLink to get ALL items (Pagination)
+     */
+    private function fetchAllPages(string $initialPath): array {
+        $allItems = [];
+        $nextLink = $initialPath; // Start with the relative path
 
-	/**
-	 * Get a single item by path relative to mount root.
-	 *
-	 * @param string $path relative path
-	 * @return array<string,mixed>|null
-	 */
+        do {
+            $data = $this->graphGet($nextLink);
+            
+            if (!is_array($data) || !isset($data['value'])) {
+                break;
+            }
+
+            $allItems = array_merge($allItems, $data['value']);
+            
+            // Check if there is a next page
+            $nextLink = $data['@odata.nextLink'] ?? null;
+            
+        } while ($nextLink !== null);
+
+        return $allItems;
+    }
+
+    private function graphGet(string $pathOrUrl): ?array {
+        if (!$this->ensureAccessToken()) return null;
+
+        $client = $this->httpClientService->newClient();
+        
+        // Handle full URLs (from @odata.nextLink) or relative paths
+        $url = str_starts_with($pathOrUrl, 'http') ? $pathOrUrl : self::GRAPH_BASE . $pathOrUrl;
+
+        try {
+            $response = $client->get($url, [
+                'headers' => [
+                    'Authorization' => 'Bearer ' . $this->accessToken,
+                    'Accept'        => 'application/json',
+                ],
+                'timeout' => self::API_TIMEOUT, // Used const (120s)
+            ]);
+
+            $body = (string)$response->getBody();
+            return json_decode($body, true);
+        } catch (\Throwable $e) {
+            $this->log('graphGet(): error', ['url' => $url, 'msg' => $e->getMessage()]);
+            return null;
+        }
+    }
+
+    private function ensureAccessToken(): bool {
+        if ($this->accessToken !== null) return true;
+
+        $user = $this->userSession->getUser();
+        if ($user === null) {
+            // CLI/Cron Fallback
+            $userId = 'admin89'; 
+            $this->log('ensureAccessToken(): CLI/Cron detected, using: ' . $userId);
+        } else {
+            $userId = $user->getUID();
+        }
+
+        $accessToken = $this->tokenService->getValidAccessToken(
+            0, $userId, $this->tenant, $this->clientId, $this->clientSecret
+        );
+
+        if ($accessToken) {
+            $this->accessToken = $accessToken;
+            return true;
+        }
+        return false;
+    }
+
+    // --- Helpers ---
+    private function splitLibraryPath(string $path): array {
+        $parts = array_values(array_filter(explode('/', $path), 'strlen'));
+        if ($parts === []) return ['Documents', ''];
+        $libraryName = array_shift($parts);
+        return [$libraryName, implode('/', $parts)];
+    }
+
+    private function encodeDrivePath(string $path): string {
+        $parts = array_values(array_filter(explode('/', $path), 'strlen'));
+        $parts = array_map('rawurlencode', $parts);
+        return implode('/', $parts);
+    }
+
+    private function buildDrivePath(string $relativePath): string {
+        $root = trim($this->mountRootPath, '/');
+        $rel  = trim($relativePath, '/');
+		
+		// --- FIX: Handle "." which causes 404s ---
+        if ($rel === '.') {
+            $rel = '';
+        }
+        // -----------------------------------------
+		
+        if ($root === '') return $rel;
+        if ($rel === '') return $root;
+        return $root . '/' . $rel;
+    }
+
 	private function getItemByPath(string $path): ?array {
-		if (!$this->initialize()) {
-			return null;
-		}
+        if (!$this->initialize()) return null;
 
-		$path = trim($path, '/');
-		if ($path === '') {
-			// Synthetic root folder
-			return [
-				'id'     => 'root',
-				'name'   => '',
-				'folder' => new \stdClass(),
-			];
-		}
+        // Clean up the path
+        $path = trim($path, '/');
+        
+        // 1. Easy check: If Nextcloud asks for root explicitly
+        if ($path === '') {
+            return ['id' => 'root', 'folder' => new \stdClass()];
+        }
 
-		$drivePath = $this->buildDrivePath($path);
+        // 2. Build the actual path on the Drive
+        $drivePath = $this->buildDrivePath($path);
 
-		$encoded = $this->encodeDrivePath($drivePath);
-		$item    = $this->graphGet("/drives/{$this->driveId}/root:/{$encoded}:/");
+        // 3. CRITICAL FIX: If the result is empty (e.g. input was "."), use the ROOT endpoint.
+        // DO NOT use "root:/:/" which causes the 400 Bad Request error.
+        if ($drivePath === '') {
+             $item = $this->graphGet("/drives/{$this->driveId}/root");
+        } else {
+             // Normal case: use the path-based endpoint
+             $encoded = $this->encodeDrivePath($drivePath);
+             $item = $this->graphGet("/drives/{$this->driveId}/root:/{$encoded}:/");
+        }
 
-		if (!is_array($item) || empty($item['id'])) {
-			return null;
-		}
+        return (is_array($item) && isset($item['id'])) ? $item : null;
+    }
 
-		return $item;
-	}
+    // --- Standard Storage Methods ---
 
-	/* ===== Implementation of required IStorage methods ===== */
+    public function file_exists(string $path): bool {
+        return $this->getItemByPath($path) !== null;
+    }
+    public function is_dir(string $path): bool {
+        $item = $this->getItemByPath($path);
+        return $item !== null && isset($item['folder']);
+    }
+    public function is_file(string $path): bool {
+        $item = $this->getItemByPath($path);
+        return $item !== null && !isset($item['folder']);
+    }
+    public function filetype(string $path): string {
+        if ($this->is_dir($path)) return 'dir';
+        if ($this->is_file($path)) return 'file';
+        return '';
+    }
+    
+    public function getDirectoryContent(string $directory = ''): Traversable {
+        $children = $this->listChildren(trim($directory, '/'));
+        $result = [];
+        foreach ($children as $item) {
+            if (!isset($item['name'])) continue;
+            $isFolder = isset($item['folder']);
+            $result[] = [
+                'name' => (string)$item['name'],
+                'size' => $isFolder ? 0 : (int)($item['size'] ?? 0),
+                'mtime' => isset($item['lastModifiedDateTime']) ? strtotime((string)$item['lastModifiedDateTime']) : time(),
+                'type' => $isFolder ? 'dir' : 'file',
+                'mimetype' => $isFolder ? 'httpd/unix-directory' : ($item['file']['mimeType'] ?? 'application/octet-stream'),
+                'permissions' => Constants::PERMISSION_READ,
+                'etag' => isset($item['eTag']) ? substr(sha1((string)$item['eTag']), 0, 32) : ''
+            ];
+        }
+        return new ArrayIterator($result);
+    }
 
-	public function file_exists(string $path): bool {
-		if ($path === '' || $path === '/') {
-			return true;
-		}
-
-		return $this->getItemByPath($path) !== null;
-	}
-
-	public function is_dir(string $path): bool {
-		if ($path === '' || $path === '/') {
-			return true;
-		}
-
-		$item = $this->getItemByPath($path);
-		return $item !== null && isset($item['folder']);
-	}
-
-	public function is_file(string $path): bool {
-		if ($path === '' || $path === '/') {
-			return false;
-		}
-
-		$item = $this->getItemByPath($path);
-		return $item !== null && !isset($item['folder']);
-	}
-
-	public function filetype(string $path): string {
-		if ($this->is_dir($path)) {
-			return 'dir';
-		}
-		if ($this->is_file($path)) {
-			return 'file';
-		}
-		return '';
-	}
-
-	public function stat(string $path): array {
-		if ($path === '' || $path === '/') {
-			return [
-				'size'        => 0,
-				'mtime'       => time(),
-				'type'        => 'dir',
-				'mimetype'    => 'httpd/unix-directory',
-				'permissions' => Constants::PERMISSION_READ,
-			];
-		}
-
-		$item = $this->getItemByPath($path);
-		if ($item === null) {
-			return [
-				'size'        => 0,
-				'mtime'       => 0,
-				'type'        => '',
-				'mimetype'    => '',
-				'permissions' => 0,
-			];
-		}
-
-		$isFolder = isset($item['folder']);
-		$size     = $isFolder ? 0 : (int)($item['size'] ?? 0);
-		$mtime    = isset($item['fileSystemInfo']['lastModifiedDateTime'])
-			? strtotime((string)$item['fileSystemInfo']['lastModifiedDateTime'])
-			: time();
-		$mimetype = $isFolder
-			? 'httpd/unix-directory'
-			: (string)($item['file']['mimeType'] ?? 'application/octet-stream');
-
-		return [
-			'size'        => $size,
-			'mtime'       => $mtime ?: time(),
-			'type'        => $isFolder ? 'dir' : 'file',
-			'mimetype'    => $mimetype,
-			'permissions' => Constants::PERMISSION_READ,
-		];
-	}
-
-	/**
-	 * Report NC permissions for files/folders in this storage.
-	 * For now: read-only.
-	 */
-	public function getPermissions(string $path): int {
-		if ($this->is_dir($path) || $this->is_file($path)) {
-			return Constants::PERMISSION_READ;
-		}
-		return 0;
-	}
-
-	/**
-	 * Directory listing for Common::opendir().
-	 *
-	 * @param string $directory
-	 * @return Traversable
-	 */
-	public function getDirectoryContent(string $directory = ''): Traversable {
-		if (!$this->initialize()) {
-			return new \ArrayIterator([]);
-		}
-
-		$relative = trim($directory, '/');
-
-		$children = $this->listChildren($relative);
-
-		$result = [];
-			foreach ($children as $item) {
-				if (!isset($item['name'])) {
-					continue;
-				}
-
-				$isFolder = isset($item['folder']);
-				$size     = $isFolder ? 0 : (int)($item['size'] ?? 0);
-				$mtime    = isset($item['fileSystemInfo']['lastModifiedDateTime'])
-					? strtotime((string)$item['fileSystemInfo']['lastModifiedDateTime'])
-					: time();
-				$mimetype = $isFolder
-					? 'httpd/unix-directory'
-					: (string)($item['file']['mimeType'] ?? 'application/octet-stream');
-
-				// Short, DB-safe etag
-				$rawEtag = isset($item['eTag']) ? (string)$item['eTag'] : '';
-				$etag    = $rawEtag !== '' ? substr(sha1($rawEtag), 0, 32) : '';
-
-				$result[] = [
-					'name'        => (string)$item['name'],
-					'size'        => $size,
-					'mtime'       => $mtime ?: time(),
-					'type'        => $isFolder ? 'dir' : 'file',
-					'mimetype'    => $mimetype,
-					'etag'        => $etag,
-					'permissions' => \OCP\Constants::PERMISSION_READ,
-				];
-			}
-
-			return new \ArrayIterator($result);
-	}		
-
-
-	/**
-	 * Read-only fopen: downloads content into a temp stream.
-	 */
-	public function fopen(string $path, string $mode) {
-		// Only allow read modes
-		if (strpbrk($mode, 'wax+') !== false) {
-			return false;
-		}
-
-		$item = $this->getItemByPath($path);
-		if ($item === null || isset($item['folder']) || !isset($item['id'])) {
-			return false;
-		}
-
-		$body = $this->downloadItemContent((string)$item['id']);
-		if ($body === null) {
-		 return false;
-		}
-
-		$stream = fopen('php://temp', 'r+');
-		if ($stream === false) {
-			return false;
-		}
-
-		fwrite($stream, $body);
-		rewind($stream);
-		return $stream;
-	}
-
-	/* ===== Read-only operations (disabled for now) ===== */
-
-	function opendir(string $path) {
-		// We let Nextcloud use getDirectoryContent() instead.
-		// Returning false is fine; the important part is that the method exists.
-		return false;
-	}
-
-	public function mkdir(string $path): bool {
-		return false;
-	}
-
-	public function rmdir(string $path): bool {
-		return false;
-	}
-
-	public function unlink(string $path): bool {
-		return false;
-	}
-
-	public function touch(string $path, int $mtime = null): bool {
-		return false;
-	}
-
-	public function rename(string $source, string $target): bool {
-		return false;
-	}
-
-	public function copy(string $source, string $target): bool {
-		return false;
-	}
+    public function fopen(string $path, string $mode) {
+        if (strpbrk($mode, 'wax+') !== false) return false;
+        $item = $this->getItemByPath($path);
+        if (!$item || isset($item['folder'])) return false;
+        
+        $contentUrl = "/drives/{$this->driveId}/items/{$item['id']}/content";
+        // graphGet returns array (JSON), so we need a raw download here.
+        // We implement a quick raw download:
+        $client = $this->httpClientService->newClient();
+        try {
+            $stream = fopen('php://temp', 'r+');
+            $client->get(self::GRAPH_BASE . $contentUrl, [
+                'headers' => ['Authorization' => 'Bearer ' . $this->accessToken],
+                'timeout' => 120, // Increased timeout
+                'sink' => $stream
+            ]);
+            rewind($stream);
+            return $stream;
+        } catch (\Throwable $e) { return false; }
+    }
+    
+    // Read-only stubs
+    public function mkdir(string $path): bool { return false; }
+    public function rmdir(string $path): bool { return false; }
+    public function unlink(string $path): bool { return false; }
+    public function touch(string $path, int $mtime = null): bool { return false; }
+    public function rename(string $source, string $target): bool { return false; }
+    public function copy(string $source, string $target): bool { return false; }
+    public function stat(string $path): array {
+         // simplified stat for brevity, relying on getDirectoryContent usually
+         // or you can copy your previous stat() implementation here.
+         // This minimal version is safe:
+         $item = $this->getItemByPath($path);
+         if (!$item) return ['size'=>0, 'mtime'=>0];
+         $isFolder = isset($item['folder']);
+         return [
+             'size' => $isFolder ? 0 : (int)($item['size']??0),
+             'mtime' => time(), 
+             'type' => $isFolder ? 'dir' : 'file',
+             'permissions' => Constants::PERMISSION_READ
+         ];
+    }
+    function opendir(string $path) { return false; }
 }

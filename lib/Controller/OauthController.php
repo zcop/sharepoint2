@@ -10,6 +10,7 @@ use OCP\AppFramework\Http\DataResponse;
 use OCP\Http\Client\IClientService;
 use OCP\IRequest;
 use OCP\IUserSession;
+use OCP\IConfig;
 use Psr\Log\LoggerInterface;
 
 /**
@@ -30,18 +31,14 @@ class OauthController extends Controller {
 	 *  - 'edcvn.onmicrosoft.com'
 	 *  - 'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx'
 	 */
-	private const TENANT = 'fc153689-bfec-4013-a019-103b83f98ee1';
-
-	/** Microsoft authorize endpoint (v2) for this tenant */
-	private const URL_AUTHORIZE    = 'https://login.microsoftonline.com/' . self::TENANT . '/oauth2/v2.0/authorize';
-	/** Microsoft token endpoint (v2) for this tenant */
-	private const URL_ACCESS_TOKEN = 'https://login.microsoftonline.com/' . self::TENANT . '/oauth2/v2.0/token';
-	/** Scopes we request */
+	private const TENANT_FALLBACK = 'common';
+	
 	private const SCOPES           = 'offline_access Files.ReadWrite.All Sites.ReadWrite.All User.Read';
 
 	private IClientService $clientService;
 	private MSOAuth2TokenService $tokenService;
 	private IUserSession $userSession;
+	private IConfig $config;
 	private LoggerInterface $logger;
 
 	public function __construct(
@@ -50,12 +47,14 @@ class OauthController extends Controller {
 		IClientService $clientService,
 		MSOAuth2TokenService $tokenService,
 		IUserSession $userSession,
+		IConfig $config,
 		LoggerInterface $logger
 	) {
 		parent::__construct($appName, $request);
 		$this->clientService = $clientService;
 		$this->tokenService  = $tokenService;
 		$this->userSession   = $userSession;
+		$this->config        = $config;
 		$this->logger        = $logger;
 	}
 
@@ -65,29 +64,40 @@ class OauthController extends Controller {
 	}
 
 	/**
-	 * Handle OAuth2 flow.
-	 *
-	 * @param string|null $client_id
-	 * @param string|null $client_secret
-	 * @param string|null $redirect
-	 * @param int|string|null $step
-	 * @param string|null $code
-	 *
-	 * @NoAdminRequired
-	 * @NoCSRFRequired
-	 */
+     * Helper to resolve Tenant ID order:
+     * 1. JS Input (param)
+     * 2. config.php (system value)
+     * 3. Fallback ('common' or your test ID)
+     */
+    private function resolveTenant(?string $input): string {
+        if ($input !== null && $input !== '') {
+            return $input;
+        }
+        $systemValue = $this->config->getSystemValue('sharepoint2_tenant', '');
+        if ($systemValue !== '') {
+            return $systemValue;
+        }
+        return self::TENANT_FALLBACK;
+    }
+	
+	/**
+     * Handle OAuth2 flow.
+     * Added $tenant parameter to accept input from JS.
+     * * @NoAdminRequired
+     * @NoCSRFRequired
+     */
 	public function receiveToken(
 		?string $client_id = null,
 		?string $client_secret = null,
+		?string $tenant = null,
 		?string $redirect = null,
 		$step = null,
 		?string $code = null
 	): DataResponse {
-		$clientId = $client_id;
-		$clientSecret = $client_secret;
+		$resolvedTenant = $this->resolveTenant($tenant);
 
-		if ($clientId === null || $clientId === '' ||
-			$clientSecret === null || $clientSecret === '' ||
+		if ($client_id === null || $client_id === '' ||
+			$client_secret === null || $client_secret === '' ||
 			$redirect === null || $redirect === '') {
 
 			$msg = 'Missing client_id, client_secret or redirect parameter';
@@ -121,15 +131,17 @@ class OauthController extends Controller {
 		// STEP 1: auth URL
 		// -------------------
 		if ($step === 1) {
+			// Build URL dynamically using the resolved tenant
+			$baseUrl = 'https://login.microsoftonline.com/' . $resolvedTenant . '/oauth2/v2.0/authorize';
 			$params = [
-				'client_id'     => $clientId,
+				'client_id'     => $client_id,
 				'response_type' => 'code',
 				'redirect_uri'  => $redirect,
 				'response_mode' => 'query',
 				'scope'         => self::SCOPES,
 			];
 
-			$authUrl = self::URL_AUTHORIZE . '?' . http_build_query($params, '', '&', PHP_QUERY_RFC3986);
+			$authUrl = $baseUrl . '?' . http_build_query($params, '', '&', PHP_QUERY_RFC3986);
 
 			return new DataResponse(
 				[
@@ -175,16 +187,19 @@ class OauthController extends Controller {
 
 				$client = $this->clientService->newClient();
 
+				// Build Token URL dynamically
+				$tokenUrl = 'https://login.microsoftonline.com/' . $resolvedTenant . '/oauth2/v2.0/token';
+				
 				$body = http_build_query([
-					'client_id'     => $clientId,
-					'client_secret' => $clientSecret,
+					'client_id'     => $client_id,
+					'client_secret' => $client_secret,
 					'grant_type'    => 'authorization_code',
 					'code'          => $code,
 					'redirect_uri'  => $redirect,
 					'scope'         => self::SCOPES,
 				], '', '&', PHP_QUERY_RFC3986);
 
-				$response = $client->post(self::URL_ACCESS_TOKEN, [
+				$response = $client->post($tokenUrl, [
 					'body'    => $body,
 					'headers' => [
 						'Content-Type' => 'application/x-www-form-urlencoded',
@@ -192,9 +207,9 @@ class OauthController extends Controller {
 					'timeout' => 30,
 				]);
 
-				$statusCode = $response->getStatusCode();
+				//$statusCode = $response->getStatusCode();
 				$content    = (string)$response->getBody();
-
+				/*
 				if ($statusCode < 200 || $statusCode >= 300) {
 					$msg = 'Token endpoint returned HTTP ' . $statusCode;
 					$this->logError($msg, ['body' => $content]);
@@ -209,7 +224,7 @@ class OauthController extends Controller {
 						],
 						Http::STATUS_OK
 					);
-				}
+				}*/
 
 				$token = json_decode($content, true);
 				if (!\is_array($token) || !isset($token['access_token'])) {
@@ -233,7 +248,7 @@ class OauthController extends Controller {
 				$this->tokenService->storeInitialToken(
 					0,
 					$userId,
-					self::TENANT,
+					$resolvedTenant,
 					$token
 				);
 
@@ -247,7 +262,7 @@ class OauthController extends Controller {
 					'token_type'    => $token['token_type'] ?? '',
 					'expires_in'    => isset($token['expires_in']) ? (int)$token['expires_in'] : 3600,
 					'obtained_at'   => time(),
-					'tenant'        => self::TENANT,
+					'tenant'        => $resolvedTenant,
 					'code_uid'      => uniqid('', true),
 				];
 

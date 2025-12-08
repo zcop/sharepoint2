@@ -10,18 +10,12 @@ use OCP\IL10N;
 
 /**
  * SharePoint Online (OAuth2) backend definition.
- *
- * For now:
- *  - Storage class is still Local (placeholder)
- *  - Library path is fixed to "Documents" (GUI shows textbox but readonly)
  */
 class SpoBackend extends Backend {
 
-    public function __construct() {
-        $appWebPath = \OC_App::getAppWebPath('sharepoint2');
-
-	/** @var IL10N $l */
-        $l = \OC::$server->getL10N('sharepoint2');
+    public function __construct(IL10N $l10n) {
+		// Temporary hardcoded path until you add app.svg
+        $appWebPath = 'apps/sharepoint2';
 
         $this
             // Backend identifier (also becomes CSS class on row)
@@ -46,15 +40,22 @@ class SpoBackend extends Backend {
                 // Required: which SharePoint site
                 new DefinitionParameter(
                     'site_url',
-                    $l->t('SharePoint Site URL (e.g. https://tenant.sharepoint.com/sites/MySite)')
+                    $l10n->t('SharePoint Site URL (e.g. https://tenant.sharepoint.com/sites/MySite)')
                 ),
 
                 // Library path, e.g. "Documents" or "Documents/SubFolder"
                 (new DefinitionParameter(
                     'library',
-                    $l->t('Library path (e.g. Documents or Documents/SubFolder)')
+                    $l10n->t('Library path (e.g. Documents or Documents/SubFolder)')
                 ))
                     ->setFlag(DefinitionParameter::FLAG_OPTIONAL),
+				
+				// NEW: Add Tenant ID field (Optional)
+				(new DefinitionParameter(
+					'tenant',
+					$l10n->t('Tenant ID (Optional)')
+				))
+					->setFlag(DefinitionParameter::FLAG_OPTIONAL), // User can leave it blank				
             ]);
     }
 }
