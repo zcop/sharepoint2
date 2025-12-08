@@ -6,7 +6,8 @@ namespace OCA\Sharepoint2\Service;
 use OCP\BackgroundJob\TimedJob;
 use OCP\BackgroundJob\IJob;
 use OCP\AppFramework\Utility\ITimeFactory;
-use OCP\IConfig; 
+use OCA\Files_External\Service\GlobalStoragesService;
+use OCA\Files_External\Lib\StorageConfig;
 use OCA\Sharepoint2\Service\MSOAuth2TokenService;
 use Psr\Log\LoggerInterface;
 
@@ -16,19 +17,19 @@ use Psr\Log\LoggerInterface;
 class RefreshTokensService extends TimedJob {
     private MSOAuth2TokenService $tokenService;
     private LoggerInterface $logger;
-    private IConfig $config;
+	private GlobalStoragesService $globalStoragesService;
 
     public function __construct(
         ITimeFactory $time,
         MSOAuth2TokenService $tokenService, // <--- Injects your service
         LoggerInterface $logger,
-        IConfig $config // <--- Injects Config (Replaces \OC::$server)
+		GlobalStoragesService $globalStoragesService
     ) {
         parent::__construct($time);
 
         $this->tokenService = $tokenService;
         $this->logger = $logger;
-        $this->config = $config;
+        $this->globalStoragesService = $globalStoragesService;
 
         // Run once a day (86400 seconds)
         $this->setInterval(86400);
@@ -42,28 +43,25 @@ class RefreshTokensService extends TimedJob {
      */
     protected function run(mixed $argument): void {
         try {
-            // 1. Get credentials from System Config
-            // We fetch these here (runtime) rather than constructor to ensure 
-            // we always have the latest values from config.php
-            $tenant = (string) $this->config->getSystemValue('sharepoint2_tenant', '');
-            $clientId = (string) $this->config->getSystemValue('sharepoint2_client_id', '');
-            $clientSecret = (string) $this->config->getSystemValue('sharepoint2_client_secret', '');
-
-            // 2. Validate Credentials
-            if ($tenant === '' || $clientId === '' || $clientSecret === '') {
-                $this->logger->warning('Sharepoint2: RefreshTokensService cannot run. Missing tenant, clientId, or clientSecret in config.php.');
+			// 1. Look for SharePoint configurations in the Database
+			$configs = $this->getSharePointConfigs();
+		   
+			if (empty($configs)) {
                 return;
             }
-
-            // 3. Call your Service
-            // Your service method signature is:
-            // refreshAllDueTokens(string $tenant, string $clientId, string $clientSecret, int $safetyMarginSeconds = 300)
-            $this->tokenService->refreshAllDueTokens(
-                $tenant,
-                $clientId,
-                $clientSecret,
-                300 // Refresh if expiring within 5 minutes
-            );
+			
+            // 2. Iterate through found configs and refresh tokens
+            foreach ($configs as $config) {
+                $this->tokenService->refreshAllDueTokens(
+					$config['tenant'],
+					$config['client_id'],
+					$config['client_secret'],
+                    300
+                );
+                
+                // Break after the first valid config (Optimized for single-tenant setups)
+                break; 
+            }			
 
         } catch (\Throwable $e) {
             $this->logger->error('Sharepoint2: RefreshTokensService failed', [
@@ -72,4 +70,37 @@ class RefreshTokensService extends TimedJob {
             ]);
         }
     }
+
+    /**
+     * Helper: Scans all Global External Storages to find SharePoint2 mounts.
+     * Returns array of credentials found in the DB.
+     */
+    private function getSharePointConfigs(): array {
+        $results = [];
+        
+        // Fetch all global storages configured in Admin UI
+        $storages = $this->globalStoragesService->getStorages();
+
+        foreach ($storages as $storage) {
+            /** @var StorageConfig $storage */
+            // Check if this is OUR app
+            if ($storage->getBackend()->getIdentifier() === 'sharepoint2') {
+                
+                $options = $storage->getBackendOptions();
+
+                // Ensure the admin actually filled out the fields
+                if (!empty($options['tenant']) && 
+                    !empty($options['client_id']) && 
+                    !empty($options['client_secret'])) {
+                    
+                    $results[] = [
+                        'tenant' => $options['tenant'],
+                        'client_id' => $options['client_id'],
+                        'client_secret' => $options['client_secret']
+                    ];
+                }
+            }
+        }
+        return $results;
+    }	
 }
