@@ -149,10 +149,10 @@ class MSOAuth2TokenService {
 
 		$result = $qb->executeQuery();
 
-		while ($row = $result->fetchAssociative()) {
+		while ($row = $result->fetch()) {
 			$this->refreshTokenRow($row, $tenant, $clientId, $clientSecret);
 		}
-		$result->free();
+		$result->closeCursor();
 	}
 
 	public function deleteTokensForStorage(int $storageId): void {
