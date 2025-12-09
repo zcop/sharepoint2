@@ -23,7 +23,8 @@ class SharePointStorage extends Common {
 
     private ?string $siteId = null;
     private ?string $driveId = null;
-
+	private ?string $mountName = null;
+	
     private string $mountRootPath = '';
     private string $numericId;
     private string $clientId = '';
@@ -288,33 +289,80 @@ class SharePointStorage extends Common {
         return (is_array($item) && isset($item['id'])) ? $item : null;
     }
 
-    /**
-     * Normalize a path that may include full Nextcloud VFS prefixes:
-     *   <userId>/files/<mountName>/actual/sharepoint/path
-     *
-     * Returns only the SharePoint-relative portion:
-     *   actual/sharepoint/path
-     *
-     * If the path does not match this pattern, returns it unchanged.
-     */
-    private function normalizeLibraryPath(string $path): string {
-        $path = ltrim($path, '/');
+   /**
+	* Normalize a path that may include full Nextcloud VFS prefixes:
+	*   <userId>/files/<mountName>/actual/sharepoint/path
+	* or:
+	*   <mountName>/actual/sharepoint/path
+	*
+	* Returns only the SharePoint-relative portion:
+	*   actual/sharepoint/path
+	*
+	* If the path does not match these patterns, returns it unchanged.
+	*/
+	private function normalizeLibraryPath(string $path): string {
+		$path = ltrim($path, '/');
 
-        if ($path === '' || $path === '.') {
-            return '';
-        }
+		if ($path === '' || $path === '.') {
+			return '';
+		}
 
-        $segments = explode('/', $path);
+		$segments = explode('/', $path);
+		$mountName = $this->getMountName();
 
-        // Pattern: "<userId>/files/<mountName>/..."
-        if (count($segments) >= 3 && $segments[1] === 'files') {
-            // Remove username, "files", and mount name
-            $segments = array_slice($segments, 3);
-            return implode('/', $segments);
-        }
+		// Pattern 1: "<userId>/files/<mountName>/..."
+		if (count($segments) >= 3 && $segments[1] === 'files') {
+			// If we know the mount name, ensure it matches the third segment.
+			// If we don't know it, we still strip the first three segments,
+			// because this pattern is always "global path" style.
+			if ($mountName === null || $segments[2] === $mountName) {
+				$segments = array_slice($segments, 3);
+				return implode('/', $segments);
+			}
+		}
 
-        return $path;
-    }
+		// Pattern 2: "<mountName>/..." leaked directly into the storage path
+		if ($mountName !== null && $segments[0] === $mountName) {
+			$segments = array_slice($segments, 1);
+			return implode('/', $segments);
+		}
+	
+		// Already looks like a library-relative path
+		return $path;
+	}
+
+   /**
+	* Lazily resolve the external storage mount point (Folder name)
+	* from the GlobalStoragesService using this storage's numeric ID.
+	*/
+	private function getMountName(): ?string {
+		if ($this->mountName !== null) {
+			return $this->mountName;
+		}
+
+		// numericId is provided by parent/Common via $this->id or similar;
+		// in your code you already store it as $this->numericId.
+		if (!isset($this->numericId) || $this->numericId === '') {
+			return null;
+		}
+
+		try {
+			/** @var \OCA\Files_External\Service\GlobalStoragesService $globalService */
+			$globalService = \OC::$server->get(\OCA\Files_External\Service\GlobalStoragesService::class);
+			$config = $globalService->getStorageConfig((int)$this->numericId);
+			if ($config !== null) {
+				$mountPoint = $config->getMountPoint(); // e.g. "SharePointOnline(OAuth2)/"
+				$this->mountName = trim($mountPoint, '/');
+			}
+		} catch (\Throwable $e) {
+			$this->logger->warning('SharePointStorage: failed to resolve mount name', [
+				'id' => $this->numericId ?? null,
+				'exception' => $e,
+			]);
+		}
+
+		return $this->mountName;
+	}
 
     // --- Standard Storage Methods ---
 
