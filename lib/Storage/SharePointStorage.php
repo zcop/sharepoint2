@@ -263,8 +263,9 @@ class SharePointStorage extends Common {
 	private function getItemByPath(string $path): ?array {
         if (!$this->initialize()) return null;
 
-        // Clean up the path
+        // Normalize Nextcloud virtual paths to SharePoint-relative paths
         $path = trim($path, '/');
+		$path = $this->normalizeLibraryPath($path);
         
         // 1. Easy check: If Nextcloud asks for root explicitly
         if ($path === '') {
@@ -285,6 +286,34 @@ class SharePointStorage extends Common {
         }
 
         return (is_array($item) && isset($item['id'])) ? $item : null;
+    }
+
+    /**
+     * Normalize a path that may include full Nextcloud VFS prefixes:
+     *   <userId>/files/<mountName>/actual/sharepoint/path
+     *
+     * Returns only the SharePoint-relative portion:
+     *   actual/sharepoint/path
+     *
+     * If the path does not match this pattern, returns it unchanged.
+     */
+    private function normalizeLibraryPath(string $path): string {
+        $path = ltrim($path, '/');
+
+        if ($path === '' || $path === '.') {
+            return '';
+        }
+
+        $segments = explode('/', $path);
+
+        // Pattern: "<userId>/files/<mountName>/..."
+        if (count($segments) >= 3 && $segments[1] === 'files') {
+            // Remove username, "files", and mount name
+            $segments = array_slice($segments, 3);
+            return implode('/', $segments);
+        }
+
+        return $path;
     }
 
     // --- Standard Storage Methods ---
