@@ -1,7 +1,6 @@
 /* global OCA, OC */
 
 $(document).ready(function () {
-	// Must match Backend identifier in SpoBackend
 	var backendId = 'sharepoint2';
 	var backendUrl = OC.generateUrl('apps/' + backendId + '/oauth');
 
@@ -11,7 +10,6 @@ $(document).ready(function () {
 			.addClass('disabled-success');
 	}
 
-	// Safety checks
 	if (!OCA.Files_External ||
 		!OCA.Files_External.Settings ||
 		!OCA.Files_External.Settings.mountConfig ||
@@ -23,17 +21,13 @@ $(document).ready(function () {
 	 * Hook into auth mechanism selection for external storage rows.
 	 */
 	OCA.Files_External.Settings.mountConfig.whenSelectAuthMechanism(function ($tr, authMechanism, scheme, onCompletion) {
-		// Only our backend + OAuth2 auth
 		if (authMechanism === 'oauth2::oauth2' && $tr.hasClass(backendId)) {
 			var config = $tr.find('.configuration');
 
-			// Wait for files_external to render its OAuth2 fields
 			setTimeout(function () {
-				// Rename Grant button so we can hook its click safely
 				config.find('[name="oauth2_grant"]')
 					.attr('name', 'oauth2_grant_sharepoint2');
 
-				// Lock library_path to "Documents"
 				var $lib = config.find('[data-parameter="library_path"]');
 				if ($lib.length) {
 					if ($lib.val().trim() === '') {
@@ -43,22 +37,20 @@ $(document).ready(function () {
 				}
 			}, 50);
 
-			// After NC finishes initializing the row
 			if (onCompletion && typeof onCompletion.then === 'function') {
 				onCompletion.then(function () {
 					var configured = $tr.find('[data-parameter="configured"]');
 
-					// If already configured → mark as granted
 					if ($(configured).val() === 'true') {
 						if (localStorage.getItem('sharepoint2_oauth2')) {
 							localStorage.removeItem('sharepoint2_oauth2');
 						}
 						displayGranted($tr);
 					} else {
-						// We might have just returned from Microsoft with ?code=...
 						var client_id = $tr.find('.configuration [data-parameter="client_id"]').val().trim();
 						var client_secret = $tr.find('.configuration [data-parameter="client_secret"]').val().trim();
-
+						var tenant = $tr.find('.configuration [data-parameter="tenant"]').val().trim();
+						
 						if (localStorage.getItem('sharepoint2_oauth2')) {
 							client_secret = atob(localStorage.getItem('sharepoint2_oauth2'));
 						}
@@ -79,6 +71,7 @@ $(document).ready(function () {
 								backend_id: backendId,
 								client_id: client_id,
 								client_secret: client_secret,
+								tenant: tenant, // --- FIX 2: Pass it to the event ---								
 								redirect: location.protocol + '//' + location.host + location.pathname,
 								tr: $tr,
 								code: params.code || '',
@@ -140,7 +133,6 @@ $(document).ready(function () {
 			});
 	});
 
-	// Namespace object
 	OCA.Files_External.Settings.OAuth2 = OCA.Files_External.Settings.OAuth2 || {};
 
 	/**
@@ -175,7 +167,6 @@ $(document).ready(function () {
 								t('files_external', 'Error getting OAuth2 URL for ' + data['backend_id'])
 							);
 						} else {
-							// Keep secret across redirect
 							localStorage.setItem('sharepoint2_oauth2', btoa(data['client_secret']));
 							window.location = result.data.url;
 						}
@@ -212,6 +203,7 @@ $(document).ready(function () {
 			step: 2,
 			client_id: data['client_id'],
 			client_secret: client_secret,
+			tenant: data['tenant'], 
 			redirect: data['redirect'],
 			code: data['code'],
 			state: data['state']
