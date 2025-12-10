@@ -35,7 +35,11 @@ class Application extends App implements IBootstrap, IBackendProvider {
             $backendService->registerBackendProvider($this);
 
             // 2. Register Cron Job
-            $jobList->add(RefreshTokensService::class);
+            if ($jobList->has(RefreshTokensService::class, null)) {
+                return;
+            }
+			
+			$jobList->add(RefreshTokensService::class);
         });
     }
 
