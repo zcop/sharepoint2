@@ -54,10 +54,11 @@ $(document).ready(function () {
 							localStorage.removeItem('sharepoint2_oauth2');
 						}
 						displayGranted($tr);
-					} else {
-						// We might have just returned from Microsoft with ?code=...
-						var client_id = $tr.find('.configuration [data-parameter="client_id"]').val().trim();
-						var client_secret = $tr.find('.configuration [data-parameter="client_secret"]').val().trim();
+						} else {
+							// We might have just returned from Microsoft with ?code=...
+							var client_id = $tr.find('.configuration [data-parameter="client_id"]').val().trim();
+							var client_secret = $tr.find('.configuration [data-parameter="client_secret"]').val().trim();
+							var tenant = $tr.find('.configuration [data-parameter="tenant"]').val().trim();
 
 						if (localStorage.getItem('sharepoint2_oauth2')) {
 							client_secret = atob(localStorage.getItem('sharepoint2_oauth2'));
@@ -75,14 +76,15 @@ $(document).ready(function () {
 							typeof client_secret === 'string' &&
 							client_secret !== ''
 						) {
-							$('.configuration').trigger('sharepoint2_oauth_step2', [{
-								backend_id: backendId,
-								client_id: client_id,
-								client_secret: client_secret,
-								redirect: location.protocol + '//' + location.host + location.pathname,
-								tr: $tr,
-								code: params.code || '',
-								state: params.state || ''
+								$('.configuration').trigger('sharepoint2_oauth_step2', [{
+									backend_id: backendId,
+									client_id: client_id,
+									client_secret: client_secret,
+									tenant: tenant,
+									redirect: location.protocol + '//' + location.host + location.pathname,
+									tr: $tr,
+									code: params.code || '',
+									state: params.state || ''
 							}]);
 						}
 					}
@@ -208,14 +210,15 @@ $(document).ready(function () {
 			client_secret = atob(localStorage.getItem('sharepoint2_oauth2'));
 		}
 
-		$.post(backendUrl, {
-			step: 2,
-			client_id: data['client_id'],
-			client_secret: client_secret,
-			redirect: data['redirect'],
-			code: data['code'],
-			state: data['state']
-		})
+			$.post(backendUrl, {
+				step: 2,
+				client_id: data['client_id'],
+				client_secret: client_secret,
+				tenant: data['tenant'],
+				redirect: data['redirect'],
+				code: data['code'],
+				state: data['state']
+			})
 			.done(function (result) {
 				if (result && result.status === 'success') {
 					$(token).val(result.data.token);
