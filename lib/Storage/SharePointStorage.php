@@ -595,9 +595,15 @@ class SharePointStorage extends Common {
                 'headers' => ['Authorization' => 'Bearer ' . $this->accessToken],
                 'timeout' => 120, // Increased timeout
             ]);
-            $body = (string)$response->getBody();
             $stream = fopen('php://temp', 'r+');
-            fwrite($stream, $body);
+            $responseStream = $response->getBody();
+            while (!$responseStream->eof()) {
+                $chunk = $responseStream->read(8192);
+                if ($chunk === '') {
+                    break;
+                }
+                fwrite($stream, $chunk);
+            }
             rewind($stream);
             return $stream;
         } catch (\Throwable $e) {
