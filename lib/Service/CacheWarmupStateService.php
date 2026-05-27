@@ -138,10 +138,10 @@ class CacheWarmupStateService {
 
     private function extractLevel1(string $directory): ?string {
         $normalized = trim($directory, '/');
-        if ($normalized === '' || str_contains($normalized, '/')) {
+        if ($normalized === '') {
             return null;
         }
-        return $normalized;
+        return explode('/', $normalized, 2)[0];
     }
 
     private function stateKey(string $mountKey): string {
