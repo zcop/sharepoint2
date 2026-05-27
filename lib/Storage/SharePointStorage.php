@@ -21,6 +21,9 @@ class SharePointStorage extends Common {
     private const GRAPH_BASE = 'https://graph.microsoft.com/v1.0';
     private const APP_TOKEN_USER = '__sharepoint2_app__';
     private const WARMUP_NOTICE_FILE = '.sharepoint2-cache-building.txt';
+    // Keep simple uploads conservative; larger payloads always use upload session.
+    private const SIMPLE_UPLOAD_MAX_BYTES = 4194304; // 4 MiB
+    private const UPLOAD_SESSION_CHUNK_BYTES = 5242880; // 5 MiB (multiple of 320 KiB)
     private const RW_PERMISSIONS = Constants::PERMISSION_READ
         | Constants::PERMISSION_CREATE
         | Constants::PERMISSION_UPDATE
@@ -318,7 +321,7 @@ class SharePointStorage extends Common {
         }
     }
 
-    private function uploadFileFromStream(string $path, $stream): bool {
+    private function uploadFileFromStream(string $path, $stream, ?int $knownSize = null): bool {
         if (!$this->initialize() || !$this->ensureAccessToken()) {
             return false;
         }
@@ -333,10 +336,57 @@ class SharePointStorage extends Common {
             return false;
         }
 
-        if (is_resource($stream)) {
-            @rewind($stream);
+        if (!is_resource($stream)) {
+            return false;
         }
 
+        @rewind($stream);
+
+        $closeWrappedStream = false;
+        $size = $knownSize;
+        if ($size === null) {
+            $stats = fstat($stream);
+            if (is_array($stats) && isset($stats['size']) && is_int($stats['size']) && $stats['size'] >= 0) {
+                $size = $stats['size'];
+            }
+        }
+
+        // If size is unknown, copy once to a temp stream so we can upload with a proper total length.
+        if ($size === null) {
+            $tmp = fopen('php://temp', 'r+');
+            if ($tmp === false) {
+                return false;
+            }
+            $copied = stream_copy_to_stream($stream, $tmp);
+            if ($copied === false) {
+                fclose($tmp);
+                return false;
+            }
+            $stream = $tmp;
+            $size = (int)$copied;
+            $closeWrappedStream = true;
+            rewind($stream);
+        }
+
+        $ok = false;
+        if ($size <= self::SIMPLE_UPLOAD_MAX_BYTES) {
+            $ok = $this->uploadSmallFile($drivePath, $stream);
+        } else {
+            $ok = $this->uploadLargeFileWithSession($drivePath, $stream, $size);
+        }
+
+        if ($closeWrappedStream) {
+            fclose($stream);
+        }
+
+        if ($ok) {
+            $this->invalidateCachesForMutation([$normalized, dirname($normalized)]);
+        }
+
+        return $ok;
+    }
+
+    private function uploadSmallFile(string $drivePath, $stream): bool {
         $encodedPath = $this->encodeDrivePath($drivePath);
         $url = self::GRAPH_BASE . "/drives/{$this->driveId}/root:/{$encodedPath}:/content";
         $client = $this->httpClientService->newClient();
@@ -350,12 +400,82 @@ class SharePointStorage extends Common {
                 ],
                 'timeout' => self::API_TIMEOUT,
             ]);
-            $this->invalidateCachesForMutation([$normalized, dirname($normalized)]);
             return true;
         } catch (\Throwable $e) {
-            $this->log('uploadFileFromStream(): error', ['url' => $url, 'path' => $path, 'msg' => $e->getMessage()]);
+            $this->log('uploadSmallFile(): error', ['url' => $url, 'path' => $drivePath, 'msg' => $e->getMessage()]);
             return false;
         }
+    }
+
+    private function uploadLargeFileWithSession(string $drivePath, $stream, int $size): bool {
+        $encodedPath = $this->encodeDrivePath($drivePath);
+        $session = $this->graphPostJson(
+            "/drives/{$this->driveId}/root:/{$encodedPath}:/createUploadSession",
+            [
+                'item' => [
+                    '@microsoft.graph.conflictBehavior' => 'replace',
+                ],
+            ]
+        );
+
+        $uploadUrl = is_array($session) ? (string)($session['uploadUrl'] ?? '') : '';
+        if ($uploadUrl === '') {
+            $this->log('uploadLargeFileWithSession(): missing uploadUrl', ['path' => $drivePath]);
+            return false;
+        }
+
+        $client = $this->httpClientService->newClient();
+        $offset = 0;
+        while ($offset < $size) {
+            $remaining = $size - $offset;
+            $chunkSize = min(self::UPLOAD_SESSION_CHUNK_BYTES, $remaining);
+            $chunk = fread($stream, $chunkSize);
+            if (!is_string($chunk) || $chunk === '') {
+                $this->log('uploadLargeFileWithSession(): failed to read chunk', [
+                    'path' => $drivePath,
+                    'offset' => $offset,
+                    'requested' => $chunkSize,
+                ]);
+                return false;
+            }
+
+            $actualLen = strlen($chunk);
+            $end = $offset + $actualLen - 1;
+
+            try {
+                // Upload-session PUT should not include Authorization header.
+                $client->put($uploadUrl, [
+                    'body' => $chunk,
+                    'headers' => [
+                        'Content-Length' => (string)$actualLen,
+                        'Content-Range' => "bytes {$offset}-{$end}/{$size}",
+                    ],
+                    'timeout' => self::API_TIMEOUT,
+                ]);
+            } catch (\Throwable $e) {
+                $this->log('uploadLargeFileWithSession(): chunk upload error', [
+                    'path' => $drivePath,
+                    'offset' => $offset,
+                    'end' => $end,
+                    'size' => $size,
+                    'msg' => $e->getMessage(),
+                ]);
+                return false;
+            }
+
+            $offset += $actualLen;
+        }
+
+        if ($offset !== $size) {
+            $this->log('uploadLargeFileWithSession(): incomplete upload', [
+                'path' => $drivePath,
+                'uploaded' => $offset,
+                'expected' => $size,
+            ]);
+            return false;
+        }
+
+        return true;
     }
 
     /**
@@ -884,21 +1004,23 @@ class SharePointStorage extends Common {
         }
 
         if ($this->file_exists($normalized)) {
-            $stream = fopen('php://temp', 'r+');
-            if ($stream === false) {
+            $item = $this->getItemByPath($normalized);
+            if (!is_array($item) || !isset($item['id'])) {
                 return false;
             }
-            $existing = $this->fopen($normalized, 'r');
-            if ($existing === false) {
-                fclose($stream);
+
+            $dt = gmdate('Y-m-d\TH:i:s\Z', $mtime ?? time());
+            $patched = $this->graphPatchJson("/drives/{$this->driveId}/items/{$item['id']}", [
+                'fileSystemInfo' => [
+                    'lastModifiedDateTime' => $dt,
+                ],
+            ]);
+            if ($patched === null) {
                 return false;
             }
-            stream_copy_to_stream($existing, $stream);
-            fclose($existing);
-            rewind($stream);
-            $ok = $this->uploadFileFromStream($normalized, $stream);
-            fclose($stream);
-            return $ok;
+
+            $this->invalidateCachesForMutation([$normalized, dirname($normalized)]);
+            return true;
         }
 
         $stream = fopen('php://temp', 'r+');
@@ -992,23 +1114,33 @@ class SharePointStorage extends Common {
     }
 
     public function file_put_contents(string $path, mixed $data): int|float|false {
+        if (is_resource($data)) {
+            $stats = fstat($data);
+            $size = null;
+            if (is_array($stats) && isset($stats['size']) && is_int($stats['size']) && $stats['size'] >= 0) {
+                $size = $stats['size'];
+            }
+            $ok = $this->uploadFileFromStream($path, $data, $size);
+            if (!$ok) {
+                return false;
+            }
+            return $size ?? 0;
+        }
+
         $stream = fopen('php://temp', 'r+');
         if ($stream === false) {
             return false;
         }
 
-        if (is_resource($data)) {
-            stream_copy_to_stream($data, $stream);
-        } else {
-            $bytes = fwrite($stream, (string)$data);
-            if ($bytes === false) {
-                fclose($stream);
-                return false;
-            }
+        $stringData = (string)$data;
+        $bytes = fwrite($stream, $stringData);
+        if ($bytes === false) {
+            fclose($stream);
+            return false;
         }
         rewind($stream);
 
-        $ok = $this->uploadFileFromStream($path, $stream);
+        $ok = $this->uploadFileFromStream($path, $stream, strlen($stringData));
         $size = fstat($stream)['size'] ?? 0;
         fclose($stream);
 
@@ -1020,7 +1152,7 @@ class SharePointStorage extends Common {
             return 0;
         }
 
-        $ok = $this->uploadFileFromStream($path, $stream);
+        $ok = $this->uploadFileFromStream($path, $stream, $size);
         if (!$ok) {
             return 0;
         }
