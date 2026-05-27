@@ -24,8 +24,8 @@ class SpoBackend extends Backend {
             // Label in "Add storage" dropdown
             ->setText('SharePoint Online (OAuth2)')
 
-            // Use OAuth2 auth scheme so files_external can bind an auth mechanism.
-            ->addAuthScheme(AuthMechanism::SCHEME_OAUTH2)
+            // App-only flow: use a non-interactive auth mechanism.
+            ->addAuthScheme(AuthMechanism::SCHEME_BUILTIN)
 
             ->setPriority(200)
 

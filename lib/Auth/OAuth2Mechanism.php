@@ -9,9 +9,8 @@ use OCP\IL10N;
 class OAuth2Mechanism extends AuthMechanism {
 	public function __construct(IL10N $l10n) {
 		$this
-			->setIdentifier('oauth2::oauth2')
-			->setScheme(self::SCHEME_OAUTH2)
-			->setText($l10n->t('OAuth2'));
+			->setIdentifier('sharepoint2::clientcredentials')
+			->setScheme(self::SCHEME_BUILTIN)
+			->setText($l10n->t('Client Credentials (App-only)'));
 	}
 }
-
