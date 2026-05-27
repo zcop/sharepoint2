@@ -21,6 +21,10 @@ class SharePointStorage extends Common {
     private const GRAPH_BASE = 'https://graph.microsoft.com/v1.0';
     private const APP_TOKEN_USER = '__sharepoint2_app__';
     private const WARMUP_NOTICE_FILE = '.sharepoint2-cache-building.txt';
+    private const RW_PERMISSIONS = Constants::PERMISSION_READ
+        | Constants::PERMISSION_CREATE
+        | Constants::PERMISSION_UPDATE
+        | Constants::PERMISSION_DELETE;
 
     private string $siteUrl;
     private string $libraryPath;
@@ -228,6 +232,183 @@ class SharePointStorage extends Common {
         } catch (\Throwable $e) {
             $this->log('graphGet(): error', ['url' => $url, 'msg' => $e->getMessage()]);
             return null;
+        }
+    }
+
+    /**
+     * @param array<string,mixed> $payload
+     */
+    private function graphPostJson(string $path, array $payload): ?array {
+        if (!$this->initialize() || !$this->ensureAccessToken()) {
+            return null;
+        }
+
+        $client = $this->httpClientService->newClient();
+        $url = self::GRAPH_BASE . $path;
+
+        try {
+            $response = $client->post($url, [
+                'body' => json_encode($payload, JSON_THROW_ON_ERROR),
+                'headers' => [
+                    'Authorization' => 'Bearer ' . $this->accessToken,
+                    'Accept' => 'application/json',
+                    'Content-Type' => 'application/json',
+                ],
+                'timeout' => self::API_TIMEOUT,
+            ]);
+            return json_decode((string)$response->getBody(), true);
+        } catch (\Throwable $e) {
+            $this->log('graphPostJson(): error', ['url' => $url, 'msg' => $e->getMessage()]);
+            return null;
+        }
+    }
+
+    /**
+     * @param array<string,mixed> $payload
+     */
+    private function graphPatchJson(string $path, array $payload): ?array {
+        if (!$this->initialize() || !$this->ensureAccessToken()) {
+            return null;
+        }
+
+        $client = $this->httpClientService->newClient();
+        $url = self::GRAPH_BASE . $path;
+
+        try {
+            $response = $client->patch($url, [
+                'body' => json_encode($payload, JSON_THROW_ON_ERROR),
+                'headers' => [
+                    'Authorization' => 'Bearer ' . $this->accessToken,
+                    'Accept' => 'application/json',
+                    'Content-Type' => 'application/json',
+                ],
+                'timeout' => self::API_TIMEOUT,
+            ]);
+            $body = (string)$response->getBody();
+            if ($body === '') {
+                return [];
+            }
+            $decoded = json_decode($body, true);
+            return is_array($decoded) ? $decoded : [];
+        } catch (\Throwable $e) {
+            $this->log('graphPatchJson(): error', ['url' => $url, 'msg' => $e->getMessage()]);
+            return null;
+        }
+    }
+
+    private function graphDeletePath(string $path): bool {
+        if (!$this->initialize() || !$this->ensureAccessToken()) {
+            return false;
+        }
+
+        $client = $this->httpClientService->newClient();
+        $url = self::GRAPH_BASE . $path;
+
+        try {
+            $client->delete($url, [
+                'headers' => [
+                    'Authorization' => 'Bearer ' . $this->accessToken,
+                ],
+                'timeout' => self::API_TIMEOUT,
+            ]);
+            return true;
+        } catch (\Throwable $e) {
+            $this->log('graphDeletePath(): error', ['url' => $url, 'msg' => $e->getMessage()]);
+            return false;
+        }
+    }
+
+    private function uploadFileFromStream(string $path, $stream): bool {
+        if (!$this->initialize() || !$this->ensureAccessToken()) {
+            return false;
+        }
+
+        $normalized = $this->normalizeStoragePath($path);
+        if ($normalized === '') {
+            return false;
+        }
+
+        $drivePath = $this->buildDrivePath($normalized);
+        if ($drivePath === '') {
+            return false;
+        }
+
+        if (is_resource($stream)) {
+            @rewind($stream);
+        }
+
+        $encodedPath = $this->encodeDrivePath($drivePath);
+        $url = self::GRAPH_BASE . "/drives/{$this->driveId}/root:/{$encodedPath}:/content";
+        $client = $this->httpClientService->newClient();
+
+        try {
+            $client->put($url, [
+                'body' => $stream,
+                'headers' => [
+                    'Authorization' => 'Bearer ' . $this->accessToken,
+                    'Content-Type' => 'application/octet-stream',
+                ],
+                'timeout' => self::API_TIMEOUT,
+            ]);
+            $this->invalidateCachesForMutation([$normalized, dirname($normalized)]);
+            return true;
+        } catch (\Throwable $e) {
+            $this->log('uploadFileFromStream(): error', ['url' => $url, 'path' => $path, 'msg' => $e->getMessage()]);
+            return false;
+        }
+    }
+
+    /**
+     * @return array{0:string,1:string}
+     */
+    private function splitParentAndName(string $path): array {
+        $normalized = trim($path, '/');
+        if ($normalized === '') {
+            return ['', ''];
+        }
+        $parent = trim((string)dirname($normalized), '/');
+        if ($parent === '.') {
+            $parent = '';
+        }
+        return [$parent, (string)basename($normalized)];
+    }
+
+    private function getItemIdForPath(string $path): ?string {
+        $normalized = $this->normalizeStoragePath($path);
+        if ($normalized === '') {
+            $root = $this->graphGet("/drives/{$this->driveId}/root");
+            if (is_array($root) && isset($root['id']) && $root['id'] !== '') {
+                return (string)$root['id'];
+            }
+            return null;
+        }
+
+        $item = $this->getItemByPath($normalized);
+        if (!is_array($item) || !isset($item['id']) || $item['id'] === '') {
+            return null;
+        }
+
+        return (string)$item['id'];
+    }
+
+    /**
+     * @param array<int,string> $paths
+     */
+    private function invalidateCachesForMutation(array $paths = []): void {
+        $this->itemCache = [];
+        $this->directoryStateCache = [];
+
+        foreach ($paths as $path) {
+            $normalized = trim($this->normalizeStoragePath($path), '/');
+            if ($normalized === '') {
+                continue;
+            }
+
+            $this->cacheStateService->updateDirectorySignature(
+                $this->mountCacheKey,
+                $normalized,
+                sha1($normalized . '|' . microtime(true))
+            );
         }
     }
 
@@ -551,7 +732,7 @@ class SharePointStorage extends Common {
                 'mtime' => isset($item['lastModifiedDateTime']) ? strtotime((string)$item['lastModifiedDateTime']) : time(),
                 'type' => $isFolder ? 'dir' : 'file',
                 'mimetype' => $isFolder ? 'httpd/unix-directory' : ($item['file']['mimeType'] ?? 'application/octet-stream'),
-                'permissions' => Constants::PERMISSION_READ,
+                'permissions' => $isFolder ? self::RW_PERMISSIONS : (self::RW_PERMISSIONS & ~Constants::PERMISSION_CREATE),
                 'etag' => $this->getItemEtag($item, (string)$item['name'])
             ];
         }
@@ -622,13 +803,239 @@ class SharePointStorage extends Common {
         }
     }
     
-    // Read-only stubs
-    public function mkdir(string $path): bool { return false; }
-    public function rmdir(string $path): bool { return false; }
-    public function unlink(string $path): bool { return false; }
-    public function touch(string $path, ?int $mtime = null): bool { return false; }
-    public function rename(string $source, string $target): bool { return false; }
-    public function copy(string $source, string $target): bool { return false; }
+    public function mkdir(string $path): bool {
+        $normalized = $this->normalizeStoragePath($path);
+        if ($normalized === '' || $this->file_exists($normalized)) {
+            return false;
+        }
+
+        [$parent, $name] = $this->splitParentAndName($normalized);
+        if ($name === '') {
+            return false;
+        }
+
+        $driveParent = $this->buildDrivePath($parent);
+        if ($parent !== '' && $this->getItemByPath($parent) === null) {
+            return false;
+        }
+
+        $endpoint = $driveParent === ''
+            ? "/drives/{$this->driveId}/root/children"
+            : "/drives/{$this->driveId}/root:/{$this->encodeDrivePath($driveParent)}:/children";
+
+        $created = $this->graphPostJson($endpoint, [
+            'name' => $name,
+            'folder' => new \stdClass(),
+            '@microsoft.graph.conflictBehavior' => 'fail',
+        ]);
+
+        if (!is_array($created) || !isset($created['id'])) {
+            return false;
+        }
+
+        $this->invalidateCachesForMutation([$normalized, $parent]);
+        return true;
+    }
+
+    public function rmdir(string $path): bool {
+        $normalized = $this->normalizeStoragePath($path);
+        if ($normalized === '') {
+            return false;
+        }
+
+        $item = $this->getItemByPath($normalized);
+        if (!is_array($item) || !isset($item['folder']) || !isset($item['id'])) {
+            return false;
+        }
+
+        $deleted = $this->graphDeletePath("/drives/{$this->driveId}/items/{$item['id']}");
+        if ($deleted) {
+            $this->invalidateCachesForMutation([$normalized, dirname($normalized)]);
+        }
+        return $deleted;
+    }
+
+    public function unlink(string $path): bool {
+        $normalized = $this->normalizeStoragePath($path);
+        if ($normalized === '') {
+            return false;
+        }
+
+        $item = $this->getItemByPath($normalized);
+        if (!is_array($item) || isset($item['folder']) || !isset($item['id'])) {
+            return false;
+        }
+
+        $deleted = $this->graphDeletePath("/drives/{$this->driveId}/items/{$item['id']}");
+        if ($deleted) {
+            $this->invalidateCachesForMutation([$normalized, dirname($normalized)]);
+        }
+        return $deleted;
+    }
+
+    public function touch(string $path, ?int $mtime = null): bool {
+        $normalized = $this->normalizeStoragePath($path);
+        if ($normalized === '') {
+            return false;
+        }
+
+        if ($this->is_dir($normalized)) {
+            return true;
+        }
+
+        if ($this->file_exists($normalized)) {
+            $stream = fopen('php://temp', 'r+');
+            if ($stream === false) {
+                return false;
+            }
+            $existing = $this->fopen($normalized, 'r');
+            if ($existing === false) {
+                fclose($stream);
+                return false;
+            }
+            stream_copy_to_stream($existing, $stream);
+            fclose($existing);
+            rewind($stream);
+            $ok = $this->uploadFileFromStream($normalized, $stream);
+            fclose($stream);
+            return $ok;
+        }
+
+        $stream = fopen('php://temp', 'r+');
+        if ($stream === false) {
+            return false;
+        }
+        $ok = $this->uploadFileFromStream($normalized, $stream);
+        fclose($stream);
+        return $ok;
+    }
+
+    public function rename(string $source, string $target): bool {
+        $sourcePath = $this->normalizeStoragePath($source);
+        $targetPath = $this->normalizeStoragePath($target);
+
+        if ($sourcePath === '' || $targetPath === '' || $sourcePath === $targetPath) {
+            return false;
+        }
+
+        $sourceItem = $this->getItemByPath($sourcePath);
+        if (!is_array($sourceItem) || !isset($sourceItem['id'])) {
+            return false;
+        }
+
+        [$targetParent, $targetName] = $this->splitParentAndName($targetPath);
+        if ($targetName === '') {
+            return false;
+        }
+
+        $targetParentId = $this->getItemIdForPath($targetParent);
+        if ($targetParentId === null) {
+            return false;
+        }
+
+        if ($this->file_exists($targetPath)) {
+            if ($this->is_dir($targetPath)) {
+                if (!$this->rmdir($targetPath)) {
+                    return false;
+                }
+            } elseif (!$this->unlink($targetPath)) {
+                return false;
+            }
+        }
+
+        $patched = $this->graphPatchJson("/drives/{$this->driveId}/items/{$sourceItem['id']}", [
+            'name' => $targetName,
+            'parentReference' => [
+                'id' => $targetParentId,
+            ],
+        ]);
+
+        if ($patched === null) {
+            return false;
+        }
+
+        $this->invalidateCachesForMutation([$sourcePath, dirname($sourcePath), $targetPath, $targetParent]);
+        return true;
+    }
+
+    public function copy(string $source, string $target): bool {
+        $sourcePath = $this->normalizeStoragePath($source);
+        $targetPath = $this->normalizeStoragePath($target);
+        if ($sourcePath === '' || $targetPath === '') {
+            return false;
+        }
+
+        if ($this->is_dir($sourcePath)) {
+            if (!$this->mkdir($targetPath)) {
+                return false;
+            }
+            $children = $this->listChildren($sourcePath);
+            foreach ($children as $child) {
+                if (!isset($child['name'])) {
+                    continue;
+                }
+                $name = (string)$child['name'];
+                if (!$this->copy($sourcePath . '/' . $name, $targetPath . '/' . $name)) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        $sourceStream = $this->fopen($sourcePath, 'r');
+        if ($sourceStream === false) {
+            return false;
+        }
+        $ok = $this->uploadFileFromStream($targetPath, $sourceStream);
+        fclose($sourceStream);
+        return $ok;
+    }
+
+    public function file_put_contents(string $path, mixed $data): int|float|false {
+        $stream = fopen('php://temp', 'r+');
+        if ($stream === false) {
+            return false;
+        }
+
+        if (is_resource($data)) {
+            stream_copy_to_stream($data, $stream);
+        } else {
+            $bytes = fwrite($stream, (string)$data);
+            if ($bytes === false) {
+                fclose($stream);
+                return false;
+            }
+        }
+        rewind($stream);
+
+        $ok = $this->uploadFileFromStream($path, $stream);
+        $size = fstat($stream)['size'] ?? 0;
+        fclose($stream);
+
+        return $ok ? (int)$size : false;
+    }
+
+    public function writeStream(string $path, $stream, ?int $size = null): int {
+        if (!is_resource($stream)) {
+            return 0;
+        }
+
+        $ok = $this->uploadFileFromStream($path, $stream);
+        if (!$ok) {
+            return 0;
+        }
+
+        if ($size !== null) {
+            return $size;
+        }
+
+        $stats = fstat($stream);
+        if (is_array($stats) && isset($stats['size']) && is_int($stats['size']) && $stats['size'] >= 0) {
+            return $stats['size'];
+        }
+
+        return 0;
+    }
     public function stat(string $path): array {
          if ($this->isWarmupNoticePath($path)) {
              return [
@@ -656,7 +1063,7 @@ class SharePointStorage extends Common {
              'size' => $isFolder ? 0 : (int)($item['size'] ?? 0),
              'mtime' => (int)$mtime,
              'type' => $isFolder ? 'dir' : 'file',
-             'permissions' => Constants::PERMISSION_READ,
+             'permissions' => $isFolder ? self::RW_PERMISSIONS : (self::RW_PERMISSIONS & ~Constants::PERMISSION_CREATE),
              'etag' => $etag,
          ];
     }
