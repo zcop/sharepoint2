@@ -13,7 +13,7 @@
     </description>
 
     <version>0.0.1</version>
-    <licence>agpl</licence>
+    <licence>gpl</licence>
     <author>zcop</author>
 
     <!-- This defines the PHP namespace root: OCA\Sharepoint2\* -->

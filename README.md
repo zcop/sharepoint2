@@ -95,4 +95,4 @@ sudo -u www-data php occ files_external:list
 
 ## License
 
-See repository license terms.
+GNU General Public License v3.0. See [`LICENSE`](./LICENSE).
