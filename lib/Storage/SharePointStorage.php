@@ -7,8 +7,10 @@ use ArrayIterator;
 use OC\Files\Storage\Common;
 use OCP\Http\Client\IClientService;
 use OCP\Constants;
-use OCP\IUserSession;
 use OCP\IConfig;
+use OCP\ICache;
+use OCP\ICacheFactory;
+use OCA\Sharepoint2\Service\CacheWarmupStateService;
 use OCA\Sharepoint2\Service\MSOAuth2TokenService;
 use Psr\Log\LoggerInterface;
 use Traversable;
@@ -17,6 +19,8 @@ class SharePointStorage extends Common {
     // Increase timeout for large folders
     private const API_TIMEOUT = 120;
     private const GRAPH_BASE = 'https://graph.microsoft.com/v1.0';
+    private const APP_TOKEN_USER = '__sharepoint2_app__';
+    private const WARMUP_NOTICE_FILE = '.sharepoint2-cache-building.txt';
 
     private string $siteUrl;
     private string $libraryPath;
@@ -25,25 +29,37 @@ class SharePointStorage extends Common {
     private ?string $driveId = null;
 
     private string $mountRootPath = '';
-    private string $numericId;
     private string $clientId = '';
     private string $clientSecret = '';
     private string $tenant;
+    private int $tokenStorageId;
+    private string $mountCacheKey;
 
     private IClientService $httpClientService;
     private MSOAuth2TokenService $tokenService;
-    private IUserSession $userSession;
+    private CacheWarmupStateService $cacheStateService;
     private IConfig $config;
     private LoggerInterface $logger;
+    private ?ICache $localCache = null;
 
     private ?string $accessToken = null;
+    /** @var array<string,array<string,mixed>|false> */
+    private array $itemCache = [];
+    /** @var array<string,array{mtime:int,etag:string}> */
+    private array $directoryStateCache = [];
 
     public function __construct(array $params) {
         $this->tokenService      = \OC::$server->get(MSOAuth2TokenService::class);
+        $this->cacheStateService = \OC::$server->get(CacheWarmupStateService::class);
         $this->httpClientService = \OC::$server->get(IClientService::class);
-        $this->userSession       = \OC::$server->get(IUserSession::class);
         $this->config            = \OC::$server->get(IConfig::class);
         $this->logger            = \OC::$server->get(LoggerInterface::class);
+        try {
+            $cacheFactory = \OC::$server->get(ICacheFactory::class);
+            $this->localCache = $cacheFactory->createLocal('sharepoint2_mount_meta');
+        } catch (\Throwable) {
+            $this->localCache = null;
+        }
 
         $this->siteUrl     = rtrim((string)($params['site_url'] ?? ''), '/');
         $this->libraryPath = trim((string)($params['library'] ?? ''), '/');
@@ -62,7 +78,9 @@ class SharePointStorage extends Common {
             $this->tenant = 'common';
         }
 
-        $this->numericId = md5($this->siteUrl . '|' . $this->libraryPath . '|' . $this->clientId);
+        $tokenKey = strtolower($this->siteUrl) . '|' . $this->libraryPath . '|' . $this->tenant . '|' . $this->clientId;
+        $this->tokenStorageId = (int)sprintf('%u', crc32($tokenKey));
+        $this->mountCacheKey = sha1($tokenKey);
 
         parent::__construct($params);
     }
@@ -88,6 +106,11 @@ class SharePointStorage extends Common {
         }
 
         if (!$this->ensureAccessToken()) return false;
+        [$libraryName, $subPath] = $this->splitLibraryPath($this->libraryPath);
+        if ($this->loadCachedMountMeta()) {
+            $this->mountRootPath = $subPath;
+            return true;
+        }
 
         $parts = parse_url($this->siteUrl);
         if (!is_array($parts) || empty($parts['host']) || empty($parts['path'])) {
@@ -104,8 +127,6 @@ class SharePointStorage extends Common {
         $this->siteId = (string)$site['id'];
 
         // 2. Get Drive ID
-        [$libraryName, $subPath] = $this->splitLibraryPath($this->libraryPath);
-        
         // Loop through all drives (pagination supported)
         $allDrives = $this->fetchAllPages("/sites/{$this->siteId}/drives");
         
@@ -120,6 +141,8 @@ class SharePointStorage extends Common {
             $this->log('initialize(): library not found', ['lib' => $libraryName]);
             return false;
         }
+
+        $this->storeCachedMountMeta();
 
         // 3. Resolve SubPath
         $this->mountRootPath = '';
@@ -211,17 +234,21 @@ class SharePointStorage extends Common {
     private function ensureAccessToken(): bool {
         if ($this->accessToken !== null) return true;
 
-        $user = $this->userSession->getUser();
-        if ($user === null) {
-            // CLI/Cron Fallback
-            $userId = 'admin89'; 
-            $this->log('ensureAccessToken(): CLI/Cron detected, using: ' . $userId);
-        } else {
-            $userId = $user->getUID();
+        if ($this->clientId === '' || $this->clientSecret === '' || $this->tenant === '') {
+            $this->log('ensureAccessToken(): missing OAuth app configuration', [
+                'hasClientId' => $this->clientId !== '',
+                'hasClientSecret' => $this->clientSecret !== '',
+                'hasTenant' => $this->tenant !== '',
+            ]);
+            return false;
         }
 
         $accessToken = $this->tokenService->getValidAccessToken(
-            0, $userId, $this->tenant, $this->clientId, $this->clientSecret
+            $this->tokenStorageId,
+            self::APP_TOKEN_USER,
+            $this->tenant,
+            $this->clientId,
+            $this->clientSecret
         );
 
         if ($accessToken) {
@@ -260,36 +287,117 @@ class SharePointStorage extends Common {
         return $root . '/' . $rel;
     }
 
-	private function getItemByPath(string $path): ?array {
+    private function getMountFolderName(): string {
+        try {
+            if (!method_exists($this, 'getMountPoint')) {
+                return '';
+            }
+            $mountPoint = trim((string)$this->getMountPoint(), '/');
+            if ($mountPoint === '') {
+                return '';
+            }
+            return (string)basename($mountPoint);
+        } catch (\Throwable) {
+            return '';
+        }
+    }
+
+    private function normalizeStoragePath(string $path): string {
+        $normalized = trim($path, '/');
+        if ($normalized === '' || $normalized === '.') {
+            return '';
+        }
+
+        // Some calls (preview/wopi) may pass absolute user storage paths.
+        // Convert "<user>/files/<mount>/..." into "<mount>/...".
+        $filesPos = strpos($normalized, '/files/');
+        if ($filesPos !== false) {
+            $normalized = substr($normalized, $filesPos + 7);
+        } elseif (str_starts_with($normalized, 'files/')) {
+            $normalized = substr($normalized, 6);
+        }
+        $normalized = trim($normalized, '/');
+
+        // External storage APIs expect paths relative to the mount root.
+        $mountFolder = $this->getMountFolderName();
+        if ($mountFolder !== '' && ($normalized === $mountFolder || str_starts_with($normalized, $mountFolder . '/'))) {
+            $normalized = ltrim(substr($normalized, strlen($mountFolder)), '/');
+        }
+
+        return $normalized;
+    }
+
+    private function isKnownAbsentMarkerPath(string $path): bool {
+        $normalized = trim($path, '/');
+        if ($normalized === '') {
+            return false;
+        }
+
+        $name = strtolower((string)basename($normalized));
+        return $name === '.noimage' || $name === '.nomedia';
+    }
+
+    private function getItemByPath(string $path): ?array {
         if (!$this->initialize()) return null;
 
-        // Clean up the path
-        $path = trim($path, '/');
+        // Clean up and normalize the path to mount-relative form.
+        $path = $this->normalizeStoragePath($path);
+        if ($this->isKnownAbsentMarkerPath($path)) {
+            $this->itemCache[$path] = false;
+            return null;
+        }
+        if (array_key_exists($path, $this->itemCache)) {
+            $cached = $this->itemCache[$path];
+            return $cached === false ? null : $cached;
+        }
         
         // 1. Easy check: If Nextcloud asks for root explicitly
         if ($path === '') {
-            return ['id' => 'root', 'folder' => new \stdClass()];
+            $root = ['id' => 'root', 'folder' => new \stdClass()];
+            $this->itemCache[$path] = $root;
+            return $root;
         }
 
-        // 2. Build the actual path on the Drive
-        $drivePath = $this->buildDrivePath($path);
+        $lookupPath = $path;
+        $item = null;
+        for ($attempt = 0; $attempt < 2; $attempt++) {
+            // 2. Build the actual path on the Drive
+            $drivePath = $this->buildDrivePath($lookupPath);
 
-        // 3. CRITICAL FIX: If the result is empty (e.g. input was "."), use the ROOT endpoint.
-        // DO NOT use "root:/:/" which causes the 400 Bad Request error.
-        if ($drivePath === '') {
-             $item = $this->graphGet("/drives/{$this->driveId}/root");
-        } else {
-             // Normal case: use the path-based endpoint
-             $encoded = $this->encodeDrivePath($drivePath);
-             $item = $this->graphGet("/drives/{$this->driveId}/root:/{$encoded}:/");
+            // 3. If empty (e.g. "."), use the ROOT endpoint.
+            if ($drivePath === '') {
+                $item = $this->graphGet("/drives/{$this->driveId}/root");
+            } else {
+                $encoded = $this->encodeDrivePath($drivePath);
+                $item = $this->graphGet("/drives/{$this->driveId}/root:/{$encoded}:/");
+            }
+
+            if (is_array($item) && isset($item['id'])) {
+                if ($lookupPath !== $path) {
+                    $this->itemCache[$lookupPath] = $item;
+                }
+                $this->itemCache[$path] = $item;
+                return $item;
+            }
+
+            // Fallback once: strip the first path segment if clients leak mountpoint name.
+            if ($attempt === 0 && str_contains($lookupPath, '/')) {
+                $lookupPath = (string)substr($lookupPath, strpos($lookupPath, '/') + 1);
+                continue;
+            }
+            break;
         }
 
-        return (is_array($item) && isset($item['id'])) ? $item : null;
+        $this->itemCache[$path] = false;
+        return null;
     }
 
     // --- Standard Storage Methods ---
 
     public function file_exists(string $path): bool {
+        if ($this->isWarmupNoticePath($path)) {
+            return true;
+        }
         return $this->getItemByPath($path) !== null;
     }
     public function is_dir(string $path): bool {
@@ -297,17 +405,137 @@ class SharePointStorage extends Common {
         return $item !== null && isset($item['folder']);
     }
     public function is_file(string $path): bool {
+        if ($this->isWarmupNoticePath($path)) {
+            return true;
+        }
         $item = $this->getItemByPath($path);
         return $item !== null && !isset($item['folder']);
     }
     public function filetype(string $path): string {
-        if ($this->is_dir($path)) return 'dir';
-        if ($this->is_file($path)) return 'file';
-        return '';
+        if ($this->isWarmupNoticePath($path)) {
+            return 'file';
+        }
+        $item = $this->getItemByPath($path);
+        if ($item === null) return '';
+        if (isset($item['folder'])) return 'dir';
+        return 'file';
+    }
+    
+    private function cacheDirectoryListing(string $directory, array $children): void {
+        $base = trim($directory, '/');
+        $maxMtime = 0;
+        $etagParts = [];
+        foreach ($children as $item) {
+            if (!is_array($item) || !isset($item['name'])) {
+                continue;
+            }
+            $fullPath = $base === '' ? (string)$item['name'] : ($base . '/' . (string)$item['name']);
+            $this->itemCache[$fullPath] = $item;
+            if (isset($item['lastModifiedDateTime'])) {
+                $mtime = strtotime((string)$item['lastModifiedDateTime']);
+                if ($mtime !== false && $mtime > $maxMtime) {
+                    $maxMtime = $mtime;
+                }
+            }
+            $etagParts[] = (string)($item['eTag'] ?? $item['cTag'] ?? $item['id'] ?? $fullPath);
+        }
+        sort($etagParts);
+        $signature = $this->buildLevel1Signature($children);
+        $this->cacheStateService->updateDirectorySignature($this->mountCacheKey, $base, $signature);
+
+        $this->directoryStateCache[$base] = [
+            'mtime' => $maxMtime > 0 ? $maxMtime : time(),
+            'etag' => substr(sha1(implode('|', $etagParts)), 0, 32),
+        ];
+    }
+
+    private function buildLevel1Signature(array $children): string {
+        $parts = [];
+        foreach ($children as $item) {
+            if (!is_array($item) || !isset($item['name'])) {
+                continue;
+            }
+
+            $name = (string)$item['name'];
+            $isFolder = isset($item['folder']);
+
+            if ($isFolder) {
+                // Ignore folder mtime/etag so deep (lv2/lv3) changes do not trigger lv1 rescans.
+                $parts[] = 'd|' . $name . '|' . (string)($item['id'] ?? $name);
+                continue;
+            }
+
+            $parts[] = 'f|' . $name
+                . '|' . (string)($item['size'] ?? 0)
+                . '|' . (string)($item['lastModifiedDateTime'] ?? '')
+                . '|' . (string)($item['eTag'] ?? $item['cTag'] ?? '');
+        }
+
+        sort($parts);
+        return sha1(implode('|', $parts));
+    }
+
+    /**
+     * @return array{mtime:int,etag:string}
+     */
+    private function getDirectoryState(string $path): array {
+        $normalized = trim($path, '/');
+        if (isset($this->directoryStateCache[$normalized])) {
+            return $this->directoryStateCache[$normalized];
+        }
+
+        $children = $this->listChildren($normalized);
+        $this->cacheDirectoryListing($normalized, $children);
+        return $this->directoryStateCache[$normalized] ?? [
+            'mtime' => time(),
+            'etag' => substr(sha1($normalized . '|' . time()), 0, 32),
+        ];
+    }
+
+    private function getItemEtag(array $item, string $path): string {
+        $raw = (string)($item['eTag'] ?? $item['cTag'] ?? $item['id'] ?? $path);
+        if ($raw === '') {
+            return '';
+        }
+        return substr(sha1($raw), 0, 32);
+    }
+
+    private function loadCachedMountMeta(): bool {
+        if ($this->localCache === null) {
+            return false;
+        }
+
+        $cached = $this->localCache->get($this->mountCacheKey);
+        if (!is_array($cached)) {
+            return false;
+        }
+
+        $siteId = $cached['siteId'] ?? null;
+        $driveId = $cached['driveId'] ?? null;
+        if (!is_string($siteId) || $siteId === '' || !is_string($driveId) || $driveId === '') {
+            return false;
+        }
+
+        $this->siteId = $siteId;
+        $this->driveId = $driveId;
+        return true;
+    }
+
+    private function storeCachedMountMeta(): void {
+        if ($this->localCache === null || $this->siteId === null || $this->driveId === null) {
+            return;
+        }
+
+        $this->localCache->set($this->mountCacheKey, [
+            'siteId' => $this->siteId,
+            'driveId' => $this->driveId,
+        ]);
     }
     
     public function getDirectoryContent(string $directory = ''): Traversable {
-        $children = $this->listChildren(trim($directory, '/'));
+        $normalizedDirectory = $this->normalizeStoragePath($directory);
+        $children = $this->listChildren($normalizedDirectory);
+        $this->cacheDirectoryListing($normalizedDirectory, $children);
         $result = [];
         foreach ($children as $item) {
             if (!isset($item['name'])) continue;
@@ -319,53 +547,161 @@ class SharePointStorage extends Common {
                 'type' => $isFolder ? 'dir' : 'file',
                 'mimetype' => $isFolder ? 'httpd/unix-directory' : ($item['file']['mimeType'] ?? 'application/octet-stream'),
                 'permissions' => Constants::PERMISSION_READ,
-                'etag' => isset($item['eTag']) ? substr(sha1((string)$item['eTag']), 0, 32) : ''
+                'etag' => $this->getItemEtag($item, (string)$item['name'])
             ];
         }
+
+        if ($this->shouldExposeWarmupNotice($normalizedDirectory, $result)) {
+            $result[] = [
+                'name' => self::WARMUP_NOTICE_FILE,
+                'size' => 96,
+                'mtime' => time(),
+                'type' => 'file',
+                'mimetype' => 'text/plain',
+                'permissions' => Constants::PERMISSION_READ,
+                'etag' => substr(sha1('warmup_notice|' . $normalizedDirectory), 0, 32),
+            ];
+        }
+
         return new ArrayIterator($result);
     }
 
     public function fopen(string $path, string $mode) {
-        if (strpbrk($mode, 'wax+') !== false) return false;
-        $item = $this->getItemByPath($path);
-        if (!$item || isset($item['folder'])) return false;
-        
-        $contentUrl = "/drives/{$this->driveId}/items/{$item['id']}/content";
-        // graphGet returns array (JSON), so we need a raw download here.
-        // We implement a quick raw download:
-        $client = $this->httpClientService->newClient();
-        try {
+        if ($this->isWarmupNoticePath($path)) {
+            if (strpbrk($mode, 'wax+') !== false) {
+                return false;
+            }
             $stream = fopen('php://temp', 'r+');
-            $client->get(self::GRAPH_BASE . $contentUrl, [
-                'headers' => ['Authorization' => 'Bearer ' . $this->accessToken],
-                'timeout' => 120, // Increased timeout
-                'sink' => $stream
-            ]);
+            fwrite($stream, "SharePoint2 is building cache for this folder. Please wait and reload in a moment.\n");
             rewind($stream);
             return $stream;
-        } catch (\Throwable $e) { return false; }
+        }
+
+        if (strpbrk($mode, 'wax+') !== false) return false;
+        $item = $this->getItemByPath($path);
+        if (!$item) {
+            $this->log('fopen(): item lookup failed', ['path' => $path]);
+            return false;
+        }
+        if (isset($item['folder'])) {
+            $this->log('fopen(): path resolved to folder', ['path' => $path, 'itemId' => (string)($item['id'] ?? '')]);
+            return false;
+        }
+        
+        $contentUrl = "/drives/{$this->driveId}/items/{$item['id']}/content";
+        $client = $this->httpClientService->newClient();
+        try {
+            $response = $client->get(self::GRAPH_BASE . $contentUrl, [
+                'headers' => ['Authorization' => 'Bearer ' . $this->accessToken],
+                'timeout' => 120, // Increased timeout
+            ]);
+            $body = (string)$response->getBody();
+            $stream = fopen('php://temp', 'r+');
+            fwrite($stream, $body);
+            rewind($stream);
+            return $stream;
+        } catch (\Throwable $e) {
+            $this->log('fopen(): content download error', [
+                'path' => $path,
+                'itemId' => (string)($item['id'] ?? ''),
+                'url' => self::GRAPH_BASE . $contentUrl,
+                'msg' => $e->getMessage(),
+            ]);
+            return false;
+        }
     }
     
     // Read-only stubs
     public function mkdir(string $path): bool { return false; }
     public function rmdir(string $path): bool { return false; }
     public function unlink(string $path): bool { return false; }
-    public function touch(string $path, int $mtime = null): bool { return false; }
+    public function touch(string $path, ?int $mtime = null): bool { return false; }
     public function rename(string $source, string $target): bool { return false; }
     public function copy(string $source, string $target): bool { return false; }
     public function stat(string $path): array {
-         // simplified stat for brevity, relying on getDirectoryContent usually
-         // or you can copy your previous stat() implementation here.
-         // This minimal version is safe:
+         if ($this->isWarmupNoticePath($path)) {
+             return [
+                 'size' => 96,
+                 'mtime' => time(),
+                 'type' => 'file',
+                 'permissions' => Constants::PERMISSION_READ,
+                 'etag' => substr(sha1('warmup_notice|' . trim($path, '/')), 0, 32),
+             ];
+         }
+
          $item = $this->getItemByPath($path);
          if (!$item) return ['size'=>0, 'mtime'=>0];
          $isFolder = isset($item['folder']);
+         $mtime = isset($item['lastModifiedDateTime']) ? strtotime((string)$item['lastModifiedDateTime']) : time();
+         $etag = $this->getItemEtag($item, $path);
+
+         if ($isFolder) {
+             $state = $this->getDirectoryState($path);
+             $mtime = max((int)$mtime, $state['mtime']);
+             $etag = $state['etag'];
+         }
+
          return [
-             'size' => $isFolder ? 0 : (int)($item['size']??0),
-             'mtime' => time(), 
+             'size' => $isFolder ? 0 : (int)($item['size'] ?? 0),
+             'mtime' => (int)$mtime,
              'type' => $isFolder ? 'dir' : 'file',
-             'permissions' => Constants::PERMISSION_READ
+             'permissions' => Constants::PERMISSION_READ,
+             'etag' => $etag,
          ];
     }
+
+    public function hasUpdated(string $path, int $time): bool {
+        $normalized = $this->normalizeStoragePath($path);
+        $item = $this->getItemByPath($normalized);
+        if ($item === null || !isset($item['folder'])) {
+            return parent::hasUpdated($path, $time);
+        }
+
+        $children = $this->listChildren($normalized);
+        $signature = $this->buildLevel1Signature($children);
+        $signatureChanged = $this->cacheStateService->updateDirectorySignature($this->mountCacheKey, $normalized, $signature);
+
+        if ($signatureChanged) {
+            return true;
+        }
+
+        return parent::hasUpdated($path, $time);
+    }
+
+    private function isWarmupNoticePath(string $path): bool {
+        $normalized = trim($path, '/');
+        if ($normalized === '' || !str_ends_with($normalized, '/' . self::WARMUP_NOTICE_FILE)) {
+            return false;
+        }
+
+        $parent = trim(dirname($normalized), '/');
+        return $this->cacheStateService->isLevel1Pending($this->mountCacheKey, $parent);
+    }
+
+    /**
+     * @param array<int,array<string,mixed>> $entries
+     */
+    private function shouldExposeWarmupNotice(string $directory, array $entries): bool {
+        if ($entries !== []) {
+            return false;
+        }
+        if (!$this->cacheStateService->isLevel1Pending($this->mountCacheKey, $directory)) {
+            return false;
+        }
+        if ($this->isScannerContext()) {
+            return false;
+        }
+        return true;
+    }
+
+    private function isScannerContext(): bool {
+        foreach (debug_backtrace(DEBUG_BACKTRACE_IGNORE_ARGS, 12) as $frame) {
+            if (($frame['class'] ?? '') === 'OC\\Files\\Cache\\Scanner') {
+                return true;
+            }
+        }
+        return false;
+    }
+
     function opendir(string $path) { return false; }
 }

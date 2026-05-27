@@ -46,57 +46,16 @@ class MSOAuth2TokenService {
 		string $tenant,
 		array $tokenResponse
 	): void {
-		$now = $this->time->getTime();
-
-		$accessToken  = (string)($tokenResponse['access_token']  ?? '');
-		$refreshToken = (string)($tokenResponse['refresh_token'] ?? '');
-		$expiresIn    = isset($tokenResponse['expires_in']) ? (int)$tokenResponse['expires_in'] : 3600;
-
-		if ($accessToken === '' || $refreshToken === '') {
-			$this->logger->warning('MSOAuth2TokenService: storeInitialToken(): missing access or refresh token', [
+		$accessToken = (string)($tokenResponse['access_token'] ?? '');
+		if ($accessToken === '') {
+			$this->logger->warning('MSOAuth2TokenService: storeInitialToken(): missing access token', [
 				'storageId' => $storageId,
-				'userId'    => $userId,
+				'userId' => $userId,
 			]);
 			return;
 		}
 
-		$expiresAt = $now + $expiresIn;
-
-		$qb = $this->db->getQueryBuilder();
-		$qb->select('id')
-			->from(self::TABLE)
-			->where($qb->expr()->eq('storage_id', $qb->createNamedParameter($storageId, \PDO::PARAM_INT)))
-			->andWhere($qb->expr()->eq('user_id', $qb->createNamedParameter($userId)));
-
-		$existing = $qb->executeQuery()->fetchOne();
-
-		if ($existing !== false) {
-			// Update existing row
-			$qb = $this->db->getQueryBuilder();
-			$qb->update(self::TABLE)
-				->set('tenant',        $qb->createNamedParameter($tenant))
-				->set('access_token',  $qb->createNamedParameter($accessToken))
-				->set('refresh_token', $qb->createNamedParameter($refreshToken))
-				->set('expires_at',    $qb->createNamedParameter($expiresAt, \PDO::PARAM_INT))
-				->set('updated_at',    $qb->createNamedParameter($now, \PDO::PARAM_INT))
-				->where($qb->expr()->eq('id', $qb->createNamedParameter((int)$existing, \PDO::PARAM_INT)));
-
-			$qb->executeStatement();
-		} else {
-			// Insert new row
-			$qb = $this->db->getQueryBuilder();
-			$qb->insert(self::TABLE)
-				->setValue('storage_id',   $qb->createNamedParameter($storageId, \PDO::PARAM_INT))
-				->setValue('user_id',      $qb->createNamedParameter($userId))
-				->setValue('tenant',       $qb->createNamedParameter($tenant))
-				->setValue('access_token', $qb->createNamedParameter($accessToken))
-				->setValue('refresh_token',$qb->createNamedParameter($refreshToken))
-				->setValue('expires_at',   $qb->createNamedParameter($expiresAt, \PDO::PARAM_INT))
-				->setValue('created_at',   $qb->createNamedParameter($now, \PDO::PARAM_INT))
-				->setValue('updated_at',   $qb->createNamedParameter($now, \PDO::PARAM_INT));
-
-			$qb->executeStatement();
-		}
+		$this->upsertTokenRow($storageId, $userId, $tenant, $tokenResponse);
 	}
 
 	public function getValidAccessToken(
@@ -106,38 +65,32 @@ class MSOAuth2TokenService {
 		string $clientId,
 		string $clientSecret
 	): ?string {
-		$row = $this->loadTokenRow($storageId, $userId);
+		$row = $this->loadTokenRow($storageId, $userId, $tenant);
 
-		if ($row === null) {
+		if ($row !== null) {
+			$now = $this->time->getTime();
+			$expiresAt = (int)$row['expires_at'];
+			if ($now < ($expiresAt - self::EXPIRY_MARGIN) && !empty($row['access_token'])) {
+				return (string)$row['access_token'];
+			}
+		}
+
+		// App-only flow: request a fresh token with client credentials.
+		$tokenResponse = $this->requestClientCredentialsToken($tenant, $clientId, $clientSecret);
+		if ($tokenResponse === null) {
 			return null;
 		}
 
-		$now = $this->time->getTime();
-		$expiresAt = (int)$row['expires_at'];
-
-		if ($now < ($expiresAt - self::EXPIRY_MARGIN)) {
-			return (string)$row['access_token'];
-		}
-
-		$updated = $this->refreshTokenRow(
-			$row,
-			$tenant,
-			$clientId,
-			$clientSecret
-		);
-
-		if ($updated === null) {
-			return null;
-		}
-
-		return (string)$updated['access_token'];
+		$this->upsertTokenRow($storageId, $userId, $tenant, $tokenResponse);
+		return (string)$tokenResponse['access_token'];
 	}
 
 	public function refreshAllDueTokens(
 		string $tenant,
 		string $clientId,
 		string $clientSecret,
-		int $safetyMarginSeconds = 300
+		int $safetyMarginSeconds = 300,
+		array $storageIds = []
 	): void {
 		$now = $this->time->getTime();
 		$threshold = $now + $safetyMarginSeconds;
@@ -145,12 +98,23 @@ class MSOAuth2TokenService {
 		$qb = $this->db->getQueryBuilder();
 		$qb->select('*')
 			->from(self::TABLE)
-			->where($qb->expr()->lte('expires_at', $qb->createNamedParameter($threshold, \PDO::PARAM_INT)));
+			->where($qb->expr()->lte('expires_at', $qb->createNamedParameter($threshold, \PDO::PARAM_INT)))
+			->andWhere($qb->expr()->eq('tenant', $qb->createNamedParameter($tenant)));
+
+		if ($storageIds !== []) {
+			$storageIds = array_values(array_unique(array_map('intval', $storageIds)));
+			$qb->andWhere($qb->expr()->in('storage_id', $qb->createNamedParameter($storageIds, IQueryBuilder::PARAM_INT_ARRAY)));
+		}
 
 		$result = $qb->executeQuery();
 
 		while ($row = $result->fetch()) {
-			$this->refreshTokenRow($row, $tenant, $clientId, $clientSecret);
+			$rowTenant = (string)($row['tenant'] ?? $tenant);
+			$tokenResponse = $this->requestClientCredentialsToken($rowTenant, $clientId, $clientSecret);
+			if ($tokenResponse === null) {
+				continue;
+			}
+			$this->upsertTokenRow((int)$row['storage_id'], (string)$row['user_id'], $rowTenant, $tokenResponse);
 		}
 		$result->closeCursor();
 	}
@@ -174,12 +138,13 @@ class MSOAuth2TokenService {
 	/**
 	 * @return array<string,mixed>|null
 	 */
-	private function loadTokenRow(int $storageId, string $userId): ?array {
+	private function loadTokenRow(int $storageId, string $userId, string $tenant): ?array {
 		$qb = $this->db->getQueryBuilder();
 		$qb->select('*')
 			->from(self::TABLE)
 			->where($qb->expr()->eq('storage_id', $qb->createNamedParameter($storageId,IQueryBuilder::PARAM_INT)))
 			->andWhere($qb->expr()->eq('user_id', $qb->createNamedParameter($userId)))
+			->andWhere($qb->expr()->eq('tenant', $qb->createNamedParameter($tenant)))
 			->setMaxResults(1);
 			
 		$result = $qb->executeQuery();
@@ -190,28 +155,10 @@ class MSOAuth2TokenService {
 	}
 
 	/**
-	 * @param array<string,mixed> $row
 	 * @return array<string,mixed>|null
 	 */
-	private function refreshTokenRow(
-		array $row,
-		string $tenant,
-		string $clientId,
-		string $clientSecret
-	): ?array {
-		$refreshToken = (string)$row['refresh_token'];
-
-		if ($refreshToken === '') {
-			$this->logger->warning('MSOAuth2TokenService: refreshTokenRow(): missing refresh token', [
-				'storageId' => $row['storage_id'] ?? null,
-				'userId'    => $row['user_id'] ?? null,
-			]);
-			return null;
-		}
-
+	private function requestClientCredentialsToken(string $tenant, string $clientId, string $clientSecret): ?array {
 		$client = $this->httpClientService->newClient();
-		$now = $this->time->getTime();
-
 		$tokenEndpoint = sprintf(
 			'https://login.microsoftonline.com/%s/oauth2/v2.0/token',
 			rawurlencode($tenant)
@@ -220,52 +167,72 @@ class MSOAuth2TokenService {
 		try {
 			$response = $client->post($tokenEndpoint, [
 				'body' => [
-					'grant_type'    => 'refresh_token',
-					'refresh_token' => $refreshToken,
-					'client_id'     => $clientId,
+					'grant_type' => 'client_credentials',
+					'client_id' => $clientId,
 					'client_secret' => $clientSecret,
-					'scope'         => 'https://graph.microsoft.com/.default offline_access',
+					'scope' => 'https://graph.microsoft.com/.default',
 				],
 			]);
-
 			$data = json_decode((string)$response->getBody(), true);
 		} catch (\Throwable $e) {
-			$this->logger->warning('MSOAuth2TokenService: refreshTokenRow(): HTTP error', [
-				'storageId' => $row['storage_id'] ?? null,
-				'userId'    => $row['user_id'] ?? null,
-				'error'     => $e->getMessage(),
+			$this->logger->warning('MSOAuth2TokenService: requestClientCredentialsToken(): HTTP error', [
+				'tenant' => $tenant,
+				'error' => $e->getMessage(),
 			]);
 			return null;
 		}
 
-		if (!is_array($data) || empty($data['access_token']) || empty($data['refresh_token'])) {
-			$this->logger->warning('MSOAuth2TokenService: refreshTokenRow(): invalid response', [
-				'storageId' => $row['storage_id'] ?? null,
-				'userId'    => $row['user_id'] ?? null,
+		if (!is_array($data) || empty($data['access_token'])) {
+			$this->logger->warning('MSOAuth2TokenService: requestClientCredentialsToken(): invalid response', [
+				'tenant' => $tenant,
 			]);
 			return null;
 		}
 
-		$accessToken  = (string)$data['access_token'];
-		$newRefresh   = (string)$data['refresh_token'];
-		$expiresIn    = isset($data['expires_in']) ? (int)$data['expires_in'] : 3600;
-		$expiresAt    = $now + $expiresIn;
+		return $data;
+	}
+
+	/**
+	 * @param array<string,mixed> $tokenResponse
+	 */
+	private function upsertTokenRow(int $storageId, string $userId, string $tenant, array $tokenResponse): void {
+		$now = $this->time->getTime();
+		$accessToken = (string)($tokenResponse['access_token'] ?? '');
+		$refreshToken = (string)($tokenResponse['refresh_token'] ?? '');
+		$expiresIn = isset($tokenResponse['expires_in']) ? (int)$tokenResponse['expires_in'] : 3600;
+		$expiresAt = $now + $expiresIn;
 
 		$qb = $this->db->getQueryBuilder();
-		$qb->update(self::TABLE)
-			->set('access_token',  $qb->createNamedParameter($accessToken))
-			->set('refresh_token', $qb->createNamedParameter($newRefresh))
-			->set('expires_at',    $qb->createNamedParameter($expiresAt, \PDO::PARAM_INT))
-			->set('updated_at',    $qb->createNamedParameter($now, \PDO::PARAM_INT))
-			->where($qb->expr()->eq('id', $qb->createNamedParameter((int)$row['id'], \PDO::PARAM_INT)));
+		$qb->select('id')
+			->from(self::TABLE)
+			->where($qb->expr()->eq('storage_id', $qb->createNamedParameter($storageId, \PDO::PARAM_INT)))
+			->andWhere($qb->expr()->eq('user_id', $qb->createNamedParameter($userId)))
+			->andWhere($qb->expr()->eq('tenant', $qb->createNamedParameter($tenant)))
+			->setMaxResults(1);
+		$existing = $qb->executeQuery()->fetchOne();
 
+		if ($existing !== false) {
+			$qb = $this->db->getQueryBuilder();
+			$qb->update(self::TABLE)
+				->set('access_token', $qb->createNamedParameter($accessToken))
+				->set('refresh_token', $qb->createNamedParameter($refreshToken))
+				->set('expires_at', $qb->createNamedParameter($expiresAt, \PDO::PARAM_INT))
+				->set('updated_at', $qb->createNamedParameter($now, \PDO::PARAM_INT))
+				->where($qb->expr()->eq('id', $qb->createNamedParameter((int)$existing, \PDO::PARAM_INT)));
+			$qb->executeStatement();
+			return;
+		}
+
+		$qb = $this->db->getQueryBuilder();
+		$qb->insert(self::TABLE)
+			->setValue('storage_id', $qb->createNamedParameter($storageId, \PDO::PARAM_INT))
+			->setValue('user_id', $qb->createNamedParameter($userId))
+			->setValue('tenant', $qb->createNamedParameter($tenant))
+			->setValue('access_token', $qb->createNamedParameter($accessToken))
+			->setValue('refresh_token', $qb->createNamedParameter($refreshToken))
+			->setValue('expires_at', $qb->createNamedParameter($expiresAt, \PDO::PARAM_INT))
+			->setValue('created_at', $qb->createNamedParameter($now, \PDO::PARAM_INT))
+			->setValue('updated_at', $qb->createNamedParameter($now, \PDO::PARAM_INT));
 		$qb->executeStatement();
-
-		$row['access_token']  = $accessToken;
-		$row['refresh_token'] = $newRefresh;
-		$row['expires_at']    = $expiresAt;
-		$row['updated_at']    = $now;
-
-		return $row;
 	}
 }

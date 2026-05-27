@@ -9,6 +9,7 @@ use OCP\AppFramework\Utility\ITimeFactory;
 use OCA\Files_External\Service\GlobalStoragesService;
 use OCA\Files_External\Lib\StorageConfig;
 use OCA\Sharepoint2\Service\MSOAuth2TokenService;
+use OCP\IConfig;
 use Psr\Log\LoggerInterface;
 
 /**
@@ -18,18 +19,21 @@ class RefreshTokensService extends TimedJob {
     private MSOAuth2TokenService $tokenService;
     private LoggerInterface $logger;
 	private GlobalStoragesService $globalStoragesService;
+    private IConfig $config;
 
     public function __construct(
         ITimeFactory $time,
         MSOAuth2TokenService $tokenService, // <--- Injects your service
         LoggerInterface $logger,
-		GlobalStoragesService $globalStoragesService
+		GlobalStoragesService $globalStoragesService,
+        IConfig $config
     ) {
         parent::__construct($time);
 
         $this->tokenService = $tokenService;
         $this->logger = $logger;
         $this->globalStoragesService = $globalStoragesService;
+        $this->config = $config;
 
         // Run once a day (86400 seconds)
         $this->setInterval(86400);
@@ -56,11 +60,9 @@ class RefreshTokensService extends TimedJob {
 					$config['tenant'],
 					$config['client_id'],
 					$config['client_secret'],
-                    300
+                    300,
+                    [$config['token_storage_id']]
                 );
-                
-                // Break after the first valid config (Optimized for single-tenant setups)
-                break; 
             }			
 
         } catch (\Throwable $e) {
@@ -89,14 +91,25 @@ class RefreshTokensService extends TimedJob {
                 $options = $storage->getBackendOptions();
 
                 // Ensure the admin actually filled out the fields
-                if (!empty($options['tenant']) && 
-                    !empty($options['client_id']) && 
-                    !empty($options['client_secret'])) {
+                $tenant = trim((string)($options['tenant'] ?? ''));
+                if ($tenant === '') {
+                    $tenant = trim((string)$this->config->getSystemValue('sharepoint2_tenant', ''));
+                }
+                if ($tenant === '') {
+                    $tenant = 'common';
+                }
+
+                if (!empty($options['client_id']) && !empty($options['client_secret'])) {
+                    $tokenKey = strtolower(rtrim((string)($options['site_url'] ?? ''), '/'))
+                        . '|' . trim((string)($options['library'] ?? ''), '/')
+                        . '|' . $tenant
+                        . '|' . (string)$options['client_id'];
                     
                     $results[] = [
-                        'tenant' => $options['tenant'],
+                        'tenant' => $tenant,
                         'client_id' => $options['client_id'],
-                        'client_secret' => $options['client_secret']
+                        'client_secret' => $options['client_secret'],
+                        'token_storage_id' => (int)sprintf('%u', crc32($tokenKey)),
                     ];
                 }
             }

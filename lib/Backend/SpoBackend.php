@@ -14,9 +14,6 @@ use OCP\IL10N;
 class SpoBackend extends Backend {
 
     public function __construct(IL10N $l10n) {
-		// Temporary hardcoded path until you add app.svg
-        $appWebPath = 'apps/sharepoint2';
-
         $this
             // Backend identifier (also becomes CSS class on row)
             ->setIdentifier('sharepoint2')
@@ -27,16 +24,23 @@ class SpoBackend extends Backend {
             // Label in "Add storage" dropdown
             ->setText('SharePoint Online (OAuth2)')
 
-            // Use generic OAuth2 auth mechanism
+            // Use OAuth2 auth scheme so files_external can bind an auth mechanism.
             ->addAuthScheme(AuthMechanism::SCHEME_OAUTH2)
-
-            // Load our custom JS
-            ->addCustomJs("../../../$appWebPath/js/sharepoint2")
 
             ->setPriority(200)
 
             // ---------- custom parameters ----------
             ->addParameters([
+                // OAuth app credentials (required)
+                new DefinitionParameter(
+                    'client_id',
+                    $l10n->t('Application (client) ID')
+                ),
+                new DefinitionParameter(
+                    'client_secret',
+                    $l10n->t('Client secret')
+                ),
+
                 // Required: which SharePoint site
                 new DefinitionParameter(
                     'site_url',
@@ -59,4 +63,3 @@ class SpoBackend extends Backend {
             ]);
     }
 }
-
