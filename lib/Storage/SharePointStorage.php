@@ -310,18 +310,23 @@ class SharePointStorage extends Common {
 
         // Some calls (preview/wopi) may pass absolute user storage paths.
         // Convert "<user>/files/<mount>/..." into "<mount>/...".
+        $wasAbsoluteStoragePath = false;
         $filesPos = strpos($normalized, '/files/');
         if ($filesPos !== false) {
+            $wasAbsoluteStoragePath = true;
             $normalized = substr($normalized, $filesPos + 7);
         } elseif (str_starts_with($normalized, 'files/')) {
+            $wasAbsoluteStoragePath = true;
             $normalized = substr($normalized, 6);
         }
         $normalized = trim($normalized, '/');
 
         // External storage APIs expect paths relative to the mount root.
-        $mountFolder = $this->getMountFolderName();
-        if ($mountFolder !== '' && ($normalized === $mountFolder || str_starts_with($normalized, $mountFolder . '/'))) {
-            $normalized = ltrim(substr($normalized, strlen($mountFolder)), '/');
+        if ($wasAbsoluteStoragePath) {
+            $mountFolder = $this->getMountFolderName();
+            if ($mountFolder !== '' && ($normalized === $mountFolder || str_starts_with($normalized, $mountFolder . '/'))) {
+                $normalized = ltrim(substr($normalized, strlen($mountFolder)), '/');
+            }
         }
 
         return $normalized;
