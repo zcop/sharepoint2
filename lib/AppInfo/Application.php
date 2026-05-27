@@ -13,7 +13,6 @@ use OCA\Sharepoint2\Backend\SpoBackend;
 use OCA\Sharepoint2\Listener\StorageChangedListener;
 use OCA\Sharepoint2\Service\RefreshTokensService;
 use OCP\BackgroundJob\IJobList; 
-use OCP\Util;
 
 use OCP\AppFramework\App;
 use OCP\AppFramework\Bootstrap\IBootstrap;
@@ -40,7 +39,6 @@ class Application extends App implements IBootstrap, IBackendProvider, IAuthMech
             // Register backend provider once the Files External service is available
             $backendService->registerBackendProvider($this);
             $backendService->registerAuthMechanismProvider($this);
-            Util::addScript(self::APP_ID, 'sharepoint2');
 
             // Guard cron job registration to avoid duplicate enqueues across boots
             if ($jobList->has(RefreshTokensService::class, null)) {
