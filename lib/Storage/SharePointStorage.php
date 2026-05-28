@@ -13,6 +13,7 @@ use OCP\Constants;
 use OCP\IConfig;
 use OCP\ICache;
 use OCP\ICacheFactory;
+use OCP\ITempManager;
 use OCA\Sharepoint2\Service\CacheWarmupStateService;
 use OCA\Sharepoint2\Service\MSOAuth2TokenService;
 use Psr\Log\LoggerInterface;
@@ -51,6 +52,7 @@ class SharePointStorage extends Common implements IChunkedFileWrite {
     private CacheWarmupStateService $cacheStateService;
     private IConfig $config;
     private LoggerInterface $logger;
+    private ITempManager $tempManager;
     private ?ICache $localCache = null;
 
     private ?string $accessToken = null;
@@ -65,6 +67,7 @@ class SharePointStorage extends Common implements IChunkedFileWrite {
         $this->httpClientService = \OC::$server->get(IClientService::class);
         $this->config            = \OC::$server->get(IConfig::class);
         $this->logger            = \OC::$server->get(LoggerInterface::class);
+        $this->tempManager       = \OC::$server->get(ITempManager::class);
         try {
             $cacheFactory = \OC::$server->get(ICacheFactory::class);
             $this->localCache = $cacheFactory->createLocal('sharepoint2_mount_meta');
@@ -237,31 +240,113 @@ class SharePointStorage extends Common implements IChunkedFileWrite {
             $body = (string)$response->getBody();
             return json_decode($body, true);
         } catch (\Throwable $e) {
-            if ($this->isNotFoundResponse($e)) {
+            $classification = $this->classifyGraphException($e);
+            if ($classification['class'] === 'not_found') {
                 return null;
             }
-            $this->log('graphGet(): error', ['url' => $url, 'msg' => $e->getMessage()]);
+            $this->logClassifiedGraphError('graphGet()', $url, $e, $classification);
             return null;
         }
     }
 
-    private function isNotFoundResponse(\Throwable $e): bool {
-        if ((int)$e->getCode() === 404) {
-            return true;
+    /**
+     * @return array{status:int,class:string,retryable:bool,loggable:bool}
+     */
+    private function classifyGraphException(\Throwable $e): array {
+        $status = $this->extractHttpStatus($e) ?? 0;
+        $message = strtolower($e->getMessage());
+
+        if ($status === 404 || str_contains($message, '404 not found') || str_contains($message, 'itemnotfound')) {
+            return [
+                'status' => 404,
+                'class' => 'not_found',
+                'retryable' => false,
+                'loggable' => false,
+            ];
+        }
+        if ($status === 401 || $status === 403) {
+            return [
+                'status' => $status,
+                'class' => 'auth',
+                'retryable' => true,
+                'loggable' => true,
+            ];
+        }
+        if ($status === 429) {
+            return [
+                'status' => 429,
+                'class' => 'throttled',
+                'retryable' => true,
+                'loggable' => true,
+            ];
+        }
+        if (in_array($status, [408, 425, 500, 502, 503, 504], true)
+            || str_contains($message, 'timed out')
+            || str_contains($message, 'temporarily unavailable')
+            || str_contains($message, 'service unavailable')
+            || str_contains($message, 'connection reset')) {
+            return [
+                'status' => $status,
+                'class' => 'transient',
+                'retryable' => true,
+                'loggable' => true,
+            ];
+        }
+        if (in_array($status, [409, 412, 423], true)) {
+            return [
+                'status' => $status,
+                'class' => 'conflict',
+                'retryable' => false,
+                'loggable' => true,
+            ];
+        }
+        if ($status >= 400 && $status <= 499) {
+            return [
+                'status' => $status,
+                'class' => 'client',
+                'retryable' => false,
+                'loggable' => true,
+            ];
+        }
+        if ($status >= 500 && $status <= 599) {
+            return [
+                'status' => $status,
+                'class' => 'server',
+                'retryable' => true,
+                'loggable' => true,
+            ];
         }
 
-        if (method_exists($e, 'getResponse')) {
-            try {
-                $response = $e->getResponse();
-                if ($response !== null && method_exists($response, 'getStatusCode') && (int)$response->getStatusCode() === 404) {
-                    return true;
-                }
-            } catch (\Throwable) {
-                // Ignore response-introspection errors and fall back to message probe.
-            }
+        return [
+            'status' => $status,
+            'class' => 'unknown',
+            'retryable' => false,
+            'loggable' => true,
+        ];
+    }
+
+    /**
+     * @param array{status:int,class:string,retryable:bool,loggable:bool}|null $classification
+     */
+    private function logClassifiedGraphError(string $op, string $url, \Throwable $e, ?array $classification = null): void {
+        $classification ??= $this->classifyGraphException($e);
+        if ($classification['loggable'] === false) {
+            return;
         }
 
-        return str_contains($e->getMessage(), '404 Not Found');
+        $this->log($op . ': ' . $classification['class'], [
+            'url' => $url,
+            'status' => (string)$classification['status'],
+            'retryable' => $classification['retryable'] ? '1' : '0',
+            'msg' => $this->truncateErrorMessage($e->getMessage()),
+        ]);
+    }
+
+    private function truncateErrorMessage(string $message, int $maxBytes = 700): string {
+        if (strlen($message) <= $maxBytes) {
+            return $message;
+        }
+        return substr($message, 0, $maxBytes) . '...';
     }
 
     /**
@@ -287,7 +372,10 @@ class SharePointStorage extends Common implements IChunkedFileWrite {
             ]);
             return json_decode((string)$response->getBody(), true);
         } catch (\Throwable $e) {
-            $this->log('graphPostJson(): error', ['url' => $url, 'msg' => $e->getMessage()]);
+            $classification = $this->classifyGraphException($e);
+            if ($classification['class'] !== 'not_found') {
+                $this->logClassifiedGraphError('graphPostJson()', $url, $e, $classification);
+            }
             return null;
         }
     }
@@ -320,7 +408,10 @@ class SharePointStorage extends Common implements IChunkedFileWrite {
             $decoded = json_decode($body, true);
             return is_array($decoded) ? $decoded : [];
         } catch (\Throwable $e) {
-            $this->log('graphPatchJson(): error', ['url' => $url, 'msg' => $e->getMessage()]);
+            $classification = $this->classifyGraphException($e);
+            if ($classification['class'] !== 'not_found') {
+                $this->logClassifiedGraphError('graphPatchJson()', $url, $e, $classification);
+            }
             return null;
         }
     }
@@ -342,7 +433,11 @@ class SharePointStorage extends Common implements IChunkedFileWrite {
             ]);
             return true;
         } catch (\Throwable $e) {
-            $this->log('graphDeletePath(): error', ['url' => $url, 'msg' => $e->getMessage()]);
+            $classification = $this->classifyGraphException($e);
+            if ($classification['class'] === 'not_found') {
+                return true;
+            }
+            $this->logClassifiedGraphError('graphDeletePath()', $url, $e, $classification);
             return false;
         }
     }
@@ -428,7 +523,8 @@ class SharePointStorage extends Common implements IChunkedFileWrite {
             ]);
             return true;
         } catch (\Throwable $e) {
-            $this->log('uploadSmallFile(): error', ['url' => $url, 'path' => $drivePath, 'msg' => $e->getMessage()]);
+            $classification = $this->classifyGraphException($e);
+            $this->logClassifiedGraphError('uploadSmallFile()', $url, $e, $classification);
             return false;
         }
     }
@@ -539,15 +635,16 @@ class SharePointStorage extends Common implements IChunkedFileWrite {
                 ]);
                 return true;
             } catch (\Throwable $e) {
-                $status = $this->extractHttpStatus($e);
-                $retryable = $status === 429 || $status === 500 || $status === 502 || $status === 503 || $status === 504;
+                $classification = $this->classifyGraphException($e);
+                $retryable = $classification['retryable'];
                 if (!$retryable || $attempt >= $maxAttempts) {
                     $this->log('uploadSessionChunkWithRetry(): final failure', [
-                        'status' => (string)($status ?? 0),
+                        'status' => (string)$classification['status'],
+                        'class' => $classification['class'],
                         'attempt' => $attempt,
                         'start' => $start,
                         'end' => $end,
-                        'msg' => $e->getMessage(),
+                        'msg' => $this->truncateErrorMessage($e->getMessage()),
                     ]);
                     return false;
                 }
@@ -1220,8 +1317,8 @@ class SharePointStorage extends Common implements IChunkedFileWrite {
                 return false;
             }
 
-            $tmpFile = tempnam(sys_get_temp_dir(), 'spt2-fopen-');
-            if ($tmpFile === false) {
+            $tmpFile = $this->createTempFile('.spt2');
+            if ($tmpFile === null) {
                 return false;
             }
 
@@ -1272,6 +1369,15 @@ class SharePointStorage extends Common implements IChunkedFileWrite {
         return false;
     }
 
+    private function createTempFile(string $postfix = ''): ?string {
+        $tmpFile = $this->tempManager->getTemporaryFile($postfix);
+        if (!is_string($tmpFile) || $tmpFile === '') {
+            $this->log('createTempFile(): failed', ['postfix' => $postfix]);
+            return null;
+        }
+        return $tmpFile;
+    }
+
     public function readStream(string $path) {
         $item = $this->getItemByPath($path);
         if (!$item) {
@@ -1291,23 +1397,61 @@ class SharePointStorage extends Common implements IChunkedFileWrite {
                 'timeout' => 120, // Increased timeout
             ]);
             $stream = fopen('php://temp', 'r+');
-            $responseStream = $response->getBody();
-            while (!$responseStream->eof()) {
-                $chunk = $responseStream->read(8192);
-                if ($chunk === '') {
-                    break;
+            if ($stream === false) {
+                return false;
+            }
+
+            $body = $response->getBody();
+            if (is_string($body)) {
+                if ($body !== '') {
+                    fwrite($stream, $body);
                 }
-                fwrite($stream, $chunk);
+            } elseif (is_resource($body)) {
+                stream_copy_to_stream($body, $stream);
+            } elseif (is_object($body) && method_exists($body, 'eof') && method_exists($body, 'read')) {
+                $idleReads = 0;
+                while (!$body->eof()) {
+                    $chunk = $body->read(8192);
+                    if (!is_string($chunk)) {
+                        break;
+                    }
+                    if ($chunk === '') {
+                        $idleReads++;
+                        if ($idleReads >= 20) {
+                            break;
+                        }
+                        usleep(10000);
+                        continue;
+                    }
+                    $idleReads = 0;
+                    fwrite($stream, $chunk);
+                }
+            } elseif (is_object($body) && method_exists($body, 'getContents')) {
+                $contents = (string)$body->getContents();
+                if ($contents !== '') {
+                    fwrite($stream, $contents);
+                }
+            } else {
+                $contents = (string)$body;
+                if ($contents !== '') {
+                    fwrite($stream, $contents);
+                }
             }
             rewind($stream);
             return $stream;
         } catch (\Throwable $e) {
-            $this->log('readStream(): content download error', [
-                'path' => $path,
-                'itemId' => (string)($item['id'] ?? ''),
-                'url' => self::GRAPH_BASE . $contentUrl,
-                'msg' => $e->getMessage(),
-            ]);
+            $classification = $this->classifyGraphException($e);
+            if ($classification['class'] !== 'not_found') {
+                $this->log('readStream(): content download error', [
+                    'class' => $classification['class'],
+                    'status' => (string)$classification['status'],
+                    'retryable' => $classification['retryable'] ? '1' : '0',
+                    'path' => $path,
+                    'itemId' => (string)($item['id'] ?? ''),
+                    'url' => self::GRAPH_BASE . $contentUrl,
+                    'msg' => $this->truncateErrorMessage($e->getMessage()),
+                ]);
+            }
             return false;
         }
     }
