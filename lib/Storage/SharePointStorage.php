@@ -4,7 +4,10 @@ declare(strict_types=1);
 namespace OCA\Sharepoint2\Storage;
 
 use ArrayIterator;
+use Icewind\Streams\CallbackWrapper;
 use OC\Files\Storage\Common;
+use OCP\Files\GenericFileException;
+use OCP\Files\Storage\IChunkedFileWrite;
 use OCP\Http\Client\IClientService;
 use OCP\Constants;
 use OCP\IConfig;
@@ -15,7 +18,7 @@ use OCA\Sharepoint2\Service\MSOAuth2TokenService;
 use Psr\Log\LoggerInterface;
 use Traversable;
 
-class SharePointStorage extends Common {
+class SharePointStorage extends Common implements IChunkedFileWrite {
     // Increase timeout for large folders
     private const API_TIMEOUT = 120;
     private const GRAPH_BASE = 'https://graph.microsoft.com/v1.0';
@@ -24,6 +27,7 @@ class SharePointStorage extends Common {
     // Keep simple uploads conservative; larger payloads always use upload session.
     private const SIMPLE_UPLOAD_MAX_BYTES = 4194304; // 4 MiB
     private const UPLOAD_SESSION_CHUNK_BYTES = 5242880; // 5 MiB (multiple of 320 KiB)
+    private const CHUNK_STAGE_DIR = '/tmp/sharepoint2-chunk-stage';
     private const RW_PERMISSIONS = Constants::PERMISSION_READ
         | Constants::PERMISSION_CREATE
         | Constants::PERMISSION_UPDATE
@@ -155,7 +159,7 @@ class SharePointStorage extends Common {
         $this->mountRootPath = '';
         if ($subPath !== '') {
             $encodedPath = $this->encodeDrivePath($subPath);
-            $item = $this->graphGet("/drives/{$this->driveId}/root:/{$encodedPath}:/");
+            $item = $this->graphGet("/drives/{$this->driveId}/root:/{$encodedPath}");
             if (!isset($item['id'])) {
                 $this->log('initialize(): subPath not found');
                 return false;
@@ -233,9 +237,31 @@ class SharePointStorage extends Common {
             $body = (string)$response->getBody();
             return json_decode($body, true);
         } catch (\Throwable $e) {
+            if ($this->isNotFoundResponse($e)) {
+                return null;
+            }
             $this->log('graphGet(): error', ['url' => $url, 'msg' => $e->getMessage()]);
             return null;
         }
+    }
+
+    private function isNotFoundResponse(\Throwable $e): bool {
+        if ((int)$e->getCode() === 404) {
+            return true;
+        }
+
+        if (method_exists($e, 'getResponse')) {
+            try {
+                $response = $e->getResponse();
+                if ($response !== null && method_exists($response, 'getStatusCode') && (int)$response->getStatusCode() === 404) {
+                    return true;
+                }
+            } catch (\Throwable) {
+                // Ignore response-introspection errors and fall back to message probe.
+            }
+        }
+
+        return str_contains($e->getMessage(), '404 Not Found');
     }
 
     /**
@@ -429,8 +455,8 @@ class SharePointStorage extends Common {
         while ($offset < $size) {
             $remaining = $size - $offset;
             $chunkSize = min(self::UPLOAD_SESSION_CHUNK_BYTES, $remaining);
-            $chunk = fread($stream, $chunkSize);
-            if (!is_string($chunk) || $chunk === '') {
+            $chunk = $this->readExactChunk($stream, $chunkSize);
+            if ($chunk === null || $chunk === '') {
                 $this->log('uploadLargeFileWithSession(): failed to read chunk', [
                     'path' => $drivePath,
                     'offset' => $offset,
@@ -442,23 +468,12 @@ class SharePointStorage extends Common {
             $actualLen = strlen($chunk);
             $end = $offset + $actualLen - 1;
 
-            try {
-                // Upload-session PUT should not include Authorization header.
-                $client->put($uploadUrl, [
-                    'body' => $chunk,
-                    'headers' => [
-                        'Content-Length' => (string)$actualLen,
-                        'Content-Range' => "bytes {$offset}-{$end}/{$size}",
-                    ],
-                    'timeout' => self::API_TIMEOUT,
-                ]);
-            } catch (\Throwable $e) {
+            if (!$this->uploadSessionChunkWithRetry($client, $uploadUrl, $chunk, $offset, $end, $size)) {
                 $this->log('uploadLargeFileWithSession(): chunk upload error', [
                     'path' => $drivePath,
                     'offset' => $offset,
                     'end' => $end,
                     'size' => $size,
-                    'msg' => $e->getMessage(),
                 ]);
                 return false;
             }
@@ -476,6 +491,309 @@ class SharePointStorage extends Common {
         }
 
         return true;
+    }
+
+    private function readExactChunk($stream, int $targetBytes): ?string {
+        if (!is_resource($stream) || $targetBytes <= 0) {
+            return null;
+        }
+
+        $buffer = '';
+        $idleReads = 0;
+        while (strlen($buffer) < $targetBytes && !feof($stream)) {
+            $piece = fread($stream, $targetBytes - strlen($buffer));
+            if ($piece === false) {
+                return null;
+            }
+            if ($piece === '') {
+                // Some wrapped streams can yield short/empty interim reads.
+                $idleReads++;
+                if ($idleReads >= 20) {
+                    break;
+                }
+                usleep(10000);
+                continue;
+            }
+            $idleReads = 0;
+            $buffer .= $piece;
+        }
+
+        return $buffer;
+    }
+
+    private function uploadSessionChunkWithRetry($client, string $uploadUrl, string $chunk, int $start, int $end, int $total): bool {
+        $maxAttempts = 5;
+        $attempt = 0;
+
+        while ($attempt < $maxAttempts) {
+            $attempt++;
+            try {
+                // Upload-session PUT should not include Authorization header.
+                $client->put($uploadUrl, [
+                    'body' => $chunk,
+                    'headers' => [
+                        'Content-Length' => (string)strlen($chunk),
+                        'Content-Range' => "bytes {$start}-{$end}/{$total}",
+                    ],
+                    'timeout' => self::API_TIMEOUT,
+                ]);
+                return true;
+            } catch (\Throwable $e) {
+                $status = $this->extractHttpStatus($e);
+                $retryable = $status === 429 || $status === 500 || $status === 502 || $status === 503 || $status === 504;
+                if (!$retryable || $attempt >= $maxAttempts) {
+                    $this->log('uploadSessionChunkWithRetry(): final failure', [
+                        'status' => (string)($status ?? 0),
+                        'attempt' => $attempt,
+                        'start' => $start,
+                        'end' => $end,
+                        'msg' => $e->getMessage(),
+                    ]);
+                    return false;
+                }
+
+                $delayMs = 500 * (2 ** ($attempt - 1));
+                if (method_exists($e, 'getResponse')) {
+                    try {
+                        $response = $e->getResponse();
+                        if ($response !== null && method_exists($response, 'getHeaderLine')) {
+                            $retryAfter = trim((string)$response->getHeaderLine('Retry-After'));
+                            if ($retryAfter !== '' && ctype_digit($retryAfter)) {
+                                $delayMs = max($delayMs, ((int)$retryAfter) * 1000);
+                            }
+                        }
+                    } catch (\Throwable) {
+                        // Keep default delay when response parsing fails.
+                    }
+                }
+
+                usleep($delayMs * 1000);
+            }
+        }
+
+        return false;
+    }
+
+    private function extractHttpStatus(\Throwable $e): ?int {
+        if ((int)$e->getCode() >= 100 && (int)$e->getCode() <= 599) {
+            return (int)$e->getCode();
+        }
+        if (method_exists($e, 'getResponse')) {
+            try {
+                $response = $e->getResponse();
+                if ($response !== null && method_exists($response, 'getStatusCode')) {
+                    $status = (int)$response->getStatusCode();
+                    if ($status >= 100 && $status <= 599) {
+                        return $status;
+                    }
+                }
+            } catch (\Throwable) {
+                return null;
+            }
+        }
+        return null;
+    }
+
+    public function startChunkedWrite(string $targetPath): string {
+        $normalizedTarget = $this->normalizeStoragePath($targetPath);
+        if ($normalizedTarget === '') {
+            throw new GenericFileException('Invalid chunked upload target path');
+        }
+
+        $token = bin2hex(random_bytes(16));
+        $dir = $this->getChunkStagePath($token);
+        if (!$this->ensureChunkStageRoot()) {
+            throw new GenericFileException('Unable to prepare chunk staging root');
+        }
+        if (!@mkdir($dir, 0700, true) && !is_dir($dir)) {
+            throw new GenericFileException('Unable to create chunk staging directory');
+        }
+
+        $meta = [
+            'targetPath' => $normalizedTarget,
+            'createdAt' => time(),
+        ];
+        $encoded = json_encode($meta, JSON_UNESCAPED_SLASHES);
+        if (!is_string($encoded) || file_put_contents($dir . '/meta.json', $encoded, LOCK_EX) === false) {
+            $this->deleteDirectoryRecursively($dir);
+            throw new GenericFileException('Unable to initialize chunk staging metadata');
+        }
+
+        return $token;
+    }
+
+    public function putChunkedWritePart(string $targetPath, string $writeToken, string $chunkId, $data, ?int $size = null): ?array {
+        $partId = (int)$chunkId;
+        if ((string)$partId !== $chunkId || $partId < 1 || $partId > 10000) {
+            throw new GenericFileException('Invalid chunk id');
+        }
+        if (!is_resource($data)) {
+            throw new GenericFileException('Invalid chunk payload stream');
+        }
+
+        [$dir, $meta] = $this->loadChunkUploadMeta($writeToken);
+        $normalizedTarget = $this->normalizeStoragePath($targetPath);
+        if ($normalizedTarget === '' || !isset($meta['targetPath']) || $meta['targetPath'] !== $normalizedTarget) {
+            throw new GenericFileException('Chunked upload target mismatch');
+        }
+
+        $tmpPath = sprintf('%s/%d.part.tmp', $dir, $partId);
+        $finalPath = sprintf('%s/%d.part', $dir, $partId);
+
+        $out = @fopen($tmpPath, 'wb');
+        if ($out === false) {
+            throw new GenericFileException('Unable to open chunk staging file');
+        }
+
+        $written = stream_copy_to_stream($data, $out);
+        fclose($out);
+        if ($written === false) {
+            @unlink($tmpPath);
+            throw new GenericFileException('Unable to stage chunk payload');
+        }
+
+        if (!@rename($tmpPath, $finalPath)) {
+            @unlink($tmpPath);
+            throw new GenericFileException('Unable to finalize staged chunk');
+        }
+
+        return [
+            'chunkId' => $partId,
+            'size' => (int)$written,
+            'expected' => $size,
+        ];
+    }
+
+    public function completeChunkedWrite(string $targetPath, string $writeToken): int {
+        [$dir, $meta] = $this->loadChunkUploadMeta($writeToken);
+        $normalizedTarget = $this->normalizeStoragePath($targetPath);
+        if ($normalizedTarget === '' || !isset($meta['targetPath']) || $meta['targetPath'] !== $normalizedTarget) {
+            throw new GenericFileException('Chunked upload target mismatch');
+        }
+
+        $chunkFiles = glob($dir . '/*.part');
+        if (!is_array($chunkFiles) || $chunkFiles === []) {
+            throw new GenericFileException('No staged chunks found');
+        }
+
+        $chunkMap = [];
+        foreach ($chunkFiles as $file) {
+            $base = (string)basename($file, '.part');
+            if (!ctype_digit($base)) {
+                continue;
+            }
+            $chunkMap[(int)$base] = $file;
+        }
+        if ($chunkMap === []) {
+            throw new GenericFileException('Invalid staged chunk set');
+        }
+
+        ksort($chunkMap, SORT_NUMERIC);
+        $expected = 1;
+        foreach (array_keys($chunkMap) as $partId) {
+            if ($partId !== $expected) {
+                throw new GenericFileException('Missing chunk ' . $expected);
+            }
+            $expected++;
+        }
+
+        $assembled = fopen('php://temp/maxmemory:1048576', 'w+b');
+        if ($assembled === false) {
+            throw new GenericFileException('Unable to open assemble stream');
+        }
+
+        $totalSize = 0;
+        foreach ($chunkMap as $chunkPath) {
+            $in = @fopen($chunkPath, 'rb');
+            if ($in === false) {
+                fclose($assembled);
+                throw new GenericFileException('Unable to read staged chunk');
+            }
+
+            $copied = stream_copy_to_stream($in, $assembled);
+            fclose($in);
+            if ($copied === false) {
+                fclose($assembled);
+                throw new GenericFileException('Unable to assemble staged chunks');
+            }
+            $totalSize += (int)$copied;
+        }
+
+        rewind($assembled);
+        $uploaded = $this->uploadFileFromStream($normalizedTarget, $assembled, $totalSize);
+        fclose($assembled);
+
+        if (!$uploaded) {
+            throw new GenericFileException('Unable to upload assembled file to SharePoint');
+        }
+
+        $this->deleteDirectoryRecursively($dir);
+        return $totalSize;
+    }
+
+    public function cancelChunkedWrite(string $targetPath, string $writeToken): void {
+        $dir = $this->getChunkStagePath($writeToken);
+        if (is_dir($dir)) {
+            $this->deleteDirectoryRecursively($dir);
+        }
+    }
+
+    private function ensureChunkStageRoot(): bool {
+        if (is_dir(self::CHUNK_STAGE_DIR)) {
+            return true;
+        }
+        return @mkdir(self::CHUNK_STAGE_DIR, 0700, true) || is_dir(self::CHUNK_STAGE_DIR);
+    }
+
+    private function getChunkStagePath(string $writeToken): string {
+        if (!preg_match('/^[a-f0-9]{32}$/', $writeToken)) {
+            return self::CHUNK_STAGE_DIR . '/invalid-token';
+        }
+        return self::CHUNK_STAGE_DIR . '/' . $writeToken;
+    }
+
+    /**
+     * @return array{0:string,1:array<string,mixed>}
+     */
+    private function loadChunkUploadMeta(string $writeToken): array {
+        $dir = $this->getChunkStagePath($writeToken);
+        if (!is_dir($dir)) {
+            throw new GenericFileException('Chunk upload session not found');
+        }
+
+        $metaPath = $dir . '/meta.json';
+        $raw = @file_get_contents($metaPath);
+        $meta = is_string($raw) ? json_decode($raw, true) : null;
+        if (!is_array($meta)) {
+            throw new GenericFileException('Invalid chunk upload metadata');
+        }
+
+        return [$dir, $meta];
+    }
+
+    private function deleteDirectoryRecursively(string $path): void {
+        if (!is_dir($path)) {
+            return;
+        }
+
+        $entries = @scandir($path);
+        if (!is_array($entries)) {
+            return;
+        }
+
+        foreach ($entries as $entry) {
+            if ($entry === '.' || $entry === '..') {
+                continue;
+            }
+            $fullPath = $path . '/' . $entry;
+            if (is_dir($fullPath) && !is_link($fullPath)) {
+                $this->deleteDirectoryRecursively($fullPath);
+            } else {
+                @unlink($fullPath);
+            }
+        }
+
+        @rmdir($path);
     }
 
     /**
@@ -675,7 +993,7 @@ class SharePointStorage extends Common {
                 $item = $this->graphGet("/drives/{$this->driveId}/root");
             } else {
                 $encoded = $this->encodeDrivePath($drivePath);
-                $item = $this->graphGet("/drives/{$this->driveId}/root:/{$encoded}:/");
+                $item = $this->graphGet("/drives/{$this->driveId}/root:/{$encoded}");
             }
 
             if (is_array($item) && isset($item['id'])) {
@@ -883,14 +1201,85 @@ class SharePointStorage extends Common {
             return $stream;
         }
 
-        if (strpbrk($mode, 'wax+') !== false) return false;
+        $modeHead = strtolower($mode[0] ?? '');
+        $hasPlus = str_contains($mode, '+');
+
+        // Read-only open: needed by trashbin move-on-delete and previews.
+        if ($modeHead === 'r' && !$hasPlus) {
+            return $this->readStream($path);
+        }
+
+        // Append is not natively supported for this backend.
+        if ($modeHead === 'a') {
+            return false;
+        }
+
+        // Emulate writable stream via local temp file + writeback on close.
+        if (strpbrk($mode, 'wxc+') !== false || $modeHead === 'r') {
+            if ($modeHead === 'x' && $this->file_exists($path)) {
+                return false;
+            }
+
+            $tmpFile = tempnam(sys_get_temp_dir(), 'spt2-fopen-');
+            if ($tmpFile === false) {
+                return false;
+            }
+
+            $needsSeed = $modeHead === 'r' || $modeHead === 'c';
+            if ($needsSeed && $this->file_exists($path)) {
+                $source = $this->readStream($path);
+                if ($source === false) {
+                    if ($modeHead === 'r') {
+                        @unlink($tmpFile);
+                        return false;
+                    }
+                } else {
+                    $tmpOut = fopen($tmpFile, 'wb');
+                    if ($tmpOut === false) {
+                        fclose($source);
+                        @unlink($tmpFile);
+                        return false;
+                    }
+                    stream_copy_to_stream($source, $tmpOut);
+                    fclose($tmpOut);
+                    fclose($source);
+                }
+            }
+
+            $fp = fopen($tmpFile, $mode);
+            if ($fp === false) {
+                @unlink($tmpFile);
+                return false;
+            }
+
+            return CallbackWrapper::wrap($fp, null, null, function () use ($path, $tmpFile): void {
+                try {
+                    $input = @fopen($tmpFile, 'rb');
+                    if ($input === false) {
+                        return;
+                    }
+                    $ok = $this->uploadFileFromStream($path, $input);
+                    fclose($input);
+                    if (!$ok) {
+                        $this->log('fopen(): writeback failed', ['path' => $path]);
+                    }
+                } finally {
+                    @unlink($tmpFile);
+                }
+            });
+        }
+
+        return false;
+    }
+
+    public function readStream(string $path) {
         $item = $this->getItemByPath($path);
         if (!$item) {
-            $this->log('fopen(): item lookup failed', ['path' => $path]);
+            $this->log('readStream(): item lookup failed', ['path' => $path]);
             return false;
         }
         if (isset($item['folder'])) {
-            $this->log('fopen(): path resolved to folder', ['path' => $path, 'itemId' => (string)($item['id'] ?? '')]);
+            $this->log('readStream(): path resolved to folder', ['path' => $path, 'itemId' => (string)($item['id'] ?? '')]);
             return false;
         }
         
@@ -913,7 +1302,7 @@ class SharePointStorage extends Common {
             rewind($stream);
             return $stream;
         } catch (\Throwable $e) {
-            $this->log('fopen(): content download error', [
+            $this->log('readStream(): content download error', [
                 'path' => $path,
                 'itemId' => (string)($item['id'] ?? ''),
                 'url' => self::GRAPH_BASE . $contentUrl,
@@ -1145,6 +1534,11 @@ class SharePointStorage extends Common {
         fclose($stream);
 
         return $ok ? (int)$size : false;
+    }
+
+    public function needsPartFile(): bool {
+        // Force Nextcloud to keep temporary ".part" assembly local and only stream final content to SharePoint.
+        return false;
     }
 
     public function writeStream(string $path, $stream, ?int $size = null): int {
